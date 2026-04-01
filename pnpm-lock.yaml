@@ -11,13 +11,13 @@ importers:
       mongoose:
         specifier: ^8 || ^9
         version: 9.3.3
-      typescript:
-        specifier: 5.2.2
-        version: 5.2.2
     devDependencies:
       '@eslint/js':
         specifier: ^10.0.1
         version: 10.0.1(eslint@10.1.0(jiti@2.6.1))
+      '@types/node':
+        specifier: ^25.5.0
+        version: 25.5.0
       eslint:
         specifier: ^10.1.0
         version: 10.1.0(jiti@2.6.1)
@@ -27,6 +27,9 @@ importers:
       jiti:
         specifier: ^2.6.1
         version: 2.6.1
+      typescript:
+        specifier: 5.2.2
+        version: 5.2.2
       typescript-eslint:
         specifier: ^8.58.0
         version: 8.58.0(eslint@10.1.0(jiti@2.6.1))(typescript@5.2.2)
@@ -99,6 +102,9 @@ packages:
 
   '@types/json-schema@7.0.15':
     resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
+
+  '@types/node@25.5.0':
+    resolution: {integrity: sha512-jp2P3tQMSxWugkCUKLRPVUpGaL5MVFwF8RDuSRztfwgN1wmqJeMSbKlnEtQqU8UrhTmzEmZdu2I6v2dpp7XIxw==}
 
   '@types/webidl-conversions@7.0.3':
     resolution: {integrity: sha512-CiJJvcRtIgzadHCYXw7dqEnMNRjhGZlYK05Mj9OyktqV8uVT8fD2BFOB7S1uwBE3Kj2Z+4UyPmFw/Ixgw/LAlA==}
@@ -481,6 +487,9 @@ packages:
     engines: {node: '>=14.17'}
     hasBin: true
 
+  undici-types@7.18.2:
+    resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==}
+
   uri-js@4.4.1:
     resolution: {integrity: sha512-7rKUyy33Q1yc98pQ1DAmLtwX109F7TIfWlW1Ydo8Wl1ii1SeHieeh0HHfPeL2fMXK6z0s8ecKs9frCuLJvndBg==}
 
@@ -561,6 +570,10 @@ snapshots:
   '@types/estree@1.0.8': {}
 
   '@types/json-schema@7.0.15': {}
+
+  '@types/node@25.5.0':
+    dependencies:
+      undici-types: 7.18.2
 
   '@types/webidl-conversions@7.0.3': {}
 
@@ -941,6 +954,8 @@ snapshots:
       - supports-color
 
   typescript@5.2.2: {}
+
+  undici-types@7.18.2: {}
 
   uri-js@4.4.1:
     dependencies:
