@@ -1,0 +1,66 @@
+{
+  "name": "mongoose-query-find",
+  "version": "1.1.0",
+  "private": false,
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jsdev-robin/mongoose-query-find.git"
+  },
+  "author": "jsdev.robin@gmail.com",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/jsdev-robin/mongoose-query-find/issues"
+  },
+  "keywords": [
+    "mongoose",
+    "typescript",
+    "query-builder",
+    "pagination",
+    "filtering",
+    "sorting",
+    "field-limiting",
+    "regex-search",
+    "global-search",
+    "api-query",
+    "mongodb",
+    "document-query",
+    "dynamic-query",
+    "query-helper",
+    "async-query",
+    "crud-utilities"
+  ],
+  "homepage": "https://github.com/jsdev-robin/mongoose-query-find#readme",
+  "description": "QueryFind is a TypeScript utility for Mongoose that simplifies building dynamic queries. It supports advanced filtering, global search across multiple fields, sorting, field selection, and pagination for MongoDB documents, making API query handling more efficient and maintainable.",
+  "peerDependencies": {
+    "mongoose": "^8 || ^9"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.1.0",
+    "globals": "^17.4.0",
+    "jiti": "^2.6.1",
+    "typescript-eslint": "^8.58.0"
+  },
+  "dependencies": {
+    "typescript": "5.2.2"
+  }
+}
