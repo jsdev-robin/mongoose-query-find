@@ -65,12 +65,12 @@ class QueryFind<T extends Document> {
     return this;
   }
 
-  limitFields(): this {
+  limitFields(fields: string): this {
     if (this.queryString.fields) {
-      const fields = this.queryString.fields.split(',').join(' ');
-      this.query = this.query.select(fields);
+      const selected = this.queryString.fields.split(',').join(' ');
+      this.query = this.query.select(selected);
     } else {
-      this.query = this.query.select('-__v');
+      this.query = this.query.select(fields);
     }
 
     return this;
