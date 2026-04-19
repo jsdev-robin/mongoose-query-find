@@ -30,9 +30,14 @@ class QueryFind<T extends Document> {
     );
 
     const parsedQuery = JSON.parse(queryStr);
+
     Object.keys(parsedQuery).forEach((key) => {
       const val = parsedQuery[key];
-      if (typeof val === 'string') {
+      if (val === 'true') {
+        parsedQuery[key] = true;
+      } else if (val === 'false') {
+        parsedQuery[key] = false;
+      } else if (typeof val === 'string') {
         parsedQuery[key] = { $regex: val, $options: 'i' };
       }
     });
