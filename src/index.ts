@@ -29,6 +29,42 @@ const MONGO_OPERATORS_RE = /\b(eq|ne|gt|gte|lt|lte|in|nin)\b/g;
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
+ * Recursively keep only plain, JSON-serializable values (string, number,
+ * boolean, null, plain object, array). Drops anything that is a class
+ * instance, function, symbol, or undefined — which prevents circular-
+ * reference errors when req.query accidentally contains Mongoose/Express
+ * internal objects.
+ */
+function sanitize(value: unknown): unknown {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(sanitize).filter((v) => v !== undefined);
+  }
+
+  if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const sanitized = sanitize(v);
+      if (sanitized !== undefined) {
+        result[k] = sanitized;
+      }
+    }
+    return result;
+  }
+
+  // Drop class instances, functions, symbols, undefined, etc.
+  return undefined;
+}
+
+/**
  * Coerce plain string booleans to real booleans so filters like
  * `?isActive=true` work correctly against boolean schema fields.
  */
@@ -44,17 +80,23 @@ function coerceBooleans(obj: Record<string, unknown>): Record<string, unknown> {
 
 /**
  * Parse the raw query string into a Mongoose-compatible filter object.
- * Strips reserved keys and rewrites bare operator names (gt → $gt, etc.).
+ * Strips reserved keys, sanitizes all values to plain JSON-safe types,
+ * and rewrites bare operator names (gt → $gt, etc.).
  */
 function buildFilterFromQueryString(raw: QueryParams): Record<string, unknown> {
-  const queryObj = Object.fromEntries(
+  // Strip reserved keys first
+  const stripped = Object.fromEntries(
     Object.entries(raw).filter(
       ([k]) => !RESERVED_KEYS.includes(k as ReservedKey),
     ),
   );
 
+  // Sanitize to plain values only — prevents circular JSON errors
+  const safe = sanitize(stripped) as Record<string, unknown>;
+
+  // Rewrite bare operator names to MongoDB $ operators
   const withOperators = JSON.parse(
-    JSON.stringify(queryObj).replace(MONGO_OPERATORS_RE, (m) => `$${m}`),
+    JSON.stringify(safe).replace(MONGO_OPERATORS_RE, (m) => `$${m}`),
   ) as Record<string, unknown>;
 
   return coerceBooleans(withOperators);
