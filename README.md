@@ -1,41 +1,10 @@
 # mongoose-query-find
 
-> A TypeScript utility for Mongoose that simplifies building dynamic, chainable queries with filtering, global search, sorting, field selection, and pagination.
+[![npm version](https://img.shields.io/npm/v/mongoose-query-find)](https://www.npmjs.com/package/mongoose-query-find)
+[![license](https://img.shields.io/npm/l/mongoose-query-find)](https://github.com/jsdev-robin/mongoose-query-find/blob/main/LICENSE)
+[![mongoose peer](https://img.shields.io/badge/mongoose-%5E8%20%7C%7C%20%5E9-brightgreen)](https://mongoosejs.com)
 
-[![npm version](https://img.shields.io/npm/v/mongoose-query-find.svg)](https://www.npmjs.com/package/mongoose-query-find)
-[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.2-blue)](https://www.typescriptlang.org/)
-[![mongoose](https://img.shields.io/badge/mongoose-%5E8%20%7C%7C%20%5E9-green)](https://mongoosejs.com/)
-
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [API Reference](#api-reference)
-  - [filter()](#filter)
-  - [globalFilter(fields)](#globalfilterfields)
-  - [sort()](#sort)
-  - [limitFields()](#limitfields)
-  - [paginate()](#paginate)
-  - [exec()](#exec)
-- [Query String Parameters](#query-string-parameters)
-- [Examples](#examples)
-- [License](#license)
-
----
-
-## Features
-
-- **Advanced Filtering** — Supports all MongoDB comparison, logical, and element operators via query string
-- **Global Search** — Search across multiple fields simultaneously using `$or` with regex
-- **Sorting** — Sort by one or multiple fields, ascending or descending
-- **Field Limiting** — Select or exclude specific fields from results
-- **Pagination** — Built-in page/limit handling with sensible defaults
-- **Chainable API** — Fluent builder pattern for clean, readable query construction
-- **Fully Typed** — Written in TypeScript with generics for strong type safety
+A fluent, chainable query builder for Mongoose that handles filtering, global search, sorting, field projection, and pagination — all driven directly from URL query parameters with zero boilerplate.
 
 ---
 
@@ -45,187 +14,253 @@
 npm install mongoose-query-find
 ```
 
-> **Peer dependency:** Requires `mongoose@^8` or `mongoose@^9`.
+```bash
+yarn add mongoose-query-find
+```
+
+```bash
+pnpm add mongoose-query-find
+```
+
+> **Peer dependency:** requires `mongoose ^8` or `mongoose ^9` installed in your project.
 
 ---
 
 ## Quick Start
 
-```typescript
+```ts
 import QueryFind from 'mongoose-query-find';
-import { Request, Response } from 'express';
-import Product from './models/Product';
+import UserModel from './models/user';
 
-export const getProducts = async (req: Request, res: Response) => {
-  const features = new QueryFind(Product.find(), req.query)
+const result = await new QueryFind(UserModel.find(), req.query)
+  .filter()
+  .globalFilter(['name', 'email'])
+  .sort()
+  .limitFields('-password -__v')
+  .paginate();
+```
+
+`result` will look like:
+
+```json
+{
+  "data": [...],
+  "total": 84,
+  "page": 2,
+  "totalPages": 9,
+  "limit": 10
+}
+```
+
+---
+
+## Constructor
+
+```ts
+new QueryFind(query, queryString);
+```
+
+| Parameter     | Type                                | Description                                   |
+| ------------- | ----------------------------------- | --------------------------------------------- |
+| `query`       | `Query<TRawDocType[], TRawDocType>` | A Mongoose query, e.g. `Model.find()`         |
+| `queryString` | `QueryParams`                       | The parsed URL query object, e.g. `req.query` |
+
+---
+
+## Builder Methods
+
+All builder methods return `this`, so they are fully chainable in any order.
+
+### `.filter()`
+
+Parses the URL query string into a Mongoose filter. Automatically:
+
+- Strips reserved keys (`page`, `limit`, `sort`, `fields`, `q`)
+- Converts comparison operator names to MongoDB `$` syntax (`gt` → `$gt`, `lte` → `$lte`, etc.)
+- Coerces string booleans to real booleans (`"true"` → `true`, `"false"` → `false`)
+
+**Supported operators:** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`
+
+```
+GET /users?age[gte]=18&isActive=true&role=admin
+```
+
+```ts
+.filter()
+// → { age: { $gte: 18 }, isActive: true, role: 'admin' }
+```
+
+---
+
+### `.globalFilter(fields: string[])`
+
+Adds a case-insensitive `$or` regex search across the specified fields when the `q` query parameter is present. If `q` is absent, this method is a no-op.
+
+```
+GET /users?q=john
+```
+
+```ts
+.globalFilter(['name', 'email'])
+// → { $or: [{ name: /john/i }, { email: /john/i }] }
+```
+
+---
+
+### `.sort()`
+
+Applies sort order from the `sort` query parameter. Prefix a field with `-` for descending order. Multiple fields are comma-separated.
+
+```
+GET /users?sort=-createdAt,name
+```
+
+```ts
+.sort()
+// → sorts by createdAt DESC, then name ASC
+```
+
+Defaults to `{ createdAt: -1 }` when the `sort` param is absent.
+
+---
+
+### `.limitFields(defaultFields: string)`
+
+Controls which fields are returned (projection). Uses the `fields` query param when present, otherwise falls back to `defaultFields`.
+
+```
+GET /users?fields=name,email,role
+```
+
+```ts
+.limitFields('-password -__v')
+// With ?fields=name,email,role  → selects only name, email, role
+// Without ?fields               → excludes password and __v
+```
+
+---
+
+## Terminal Method
+
+### `.paginate()`
+
+Executes the query and returns a `Promise<PaginatedResult<T>>`. Makes exactly two database round-trips:
+
+1. `countDocuments` — counts total matching documents (uses index scan)
+2. `find` — fetches the requested page with sort, skip, limit, and projection applied
+
+```
+GET /users?page=2&limit=20
+```
+
+**Returns:**
+
+```ts
+{
+  data: T[];         // Documents for the current page
+  total: number;     // Total matching documents across all pages
+  page: number;      // Current page (auto-corrects to 1 if out of range)
+  totalPages: number;
+  limit: number;
+}
+```
+
+> If the requested `page` exceeds `totalPages` (e.g. after a deletion), page `1` is returned automatically so the caller always receives valid data.
+
+**Defaults:** `page=1`, `limit=10`
+
+---
+
+## Query Parameter Reference
+
+| Parameter   | Example                   | Description                                       |
+| ----------- | ------------------------- | ------------------------------------------------- |
+| `page`      | `?page=3`                 | Page number (default: `1`, min: `1`)              |
+| `limit`     | `?limit=25`               | Documents per page (default: `10`, min: `1`)      |
+| `sort`      | `?sort=-createdAt,name`   | Sort fields; prefix `-` for descending            |
+| `fields`    | `?fields=name,email`      | Comma-separated fields to include in the response |
+| `q`         | `?q=john`                 | Global search term (used by `.globalFilter()`)    |
+| _(any key)_ | `?role=admin&age[gte]=18` | Field-level filters processed by `.filter()`      |
+
+---
+
+## Full Example (Express)
+
+```ts
+import { Request, Response } from 'express';
+import QueryFind from 'mongoose-query-find';
+import UserModel from '../models/user';
+
+export const getUsers = async (req: Request, res: Response) => {
+  const result = await new QueryFind(UserModel.find(), req.query)
     .filter()
+    .globalFilter(['name', 'email', 'username'])
     .sort()
-    .limitFields()
+    .limitFields('-password -__v')
     .paginate();
 
-  const products = await features.exec();
-
-  res.json({ results: products.length, data: products });
+  res.json({
+    status: 'success',
+    ...result,
+  });
 };
 ```
 
----
+**Example requests:**
 
-## API Reference
+```bash
+# Page 2, 15 per page, only active admins sorted by name
+GET /users?page=2&limit=15&role=admin&isActive=true&sort=name
 
-### `new QueryFind(query, queryString)`
+# Search "alice" across name, email, and username
+GET /users?q=alice
 
-| Parameter     | Type            | Description                                   |
-| ------------- | --------------- | --------------------------------------------- |
-| `query`       | `Query<T[], T>` | A Mongoose query object (e.g. `Model.find()`) |
-| `queryString` | `QueryParams`   | Parsed query string from the request          |
+# Users older than 25, return only name and email
+GET /users?age[gt]=25&fields=name,email
 
----
-
-### `filter()`
-
-Applies field-level filtering from the query string. Automatically prepends `$` to MongoDB operators and wraps plain string values in a case-insensitive regex.
-
-**Supported operators:** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `regex`, `exists`, `all`, `size`, `elemMatch`, `type`, `mod`, `not`, `and`, `or`, `nor`, `text`, `where`, `geoWithin`, `geoIntersects`, `near`, `nearSphere`, `expr`, `jsonSchema`, `bitsAllClear`, `bitsAllSet`, `bitsAnyClear`, `bitsAnySet`, `rand`
-
-**Example URL:**
-
-```
-GET /api/products?price[gte]=100&category=electronics
+# Combined: search + filter + sort + pagination
+GET /users?q=john&role=editor&sort=-createdAt&page=1&limit=5
 ```
 
 ---
 
-### `globalFilter(fields)`
+## TypeScript Types
 
-Performs a global search across the specified fields using the `q` query parameter with case-insensitive regex.
+Both types are exported and available for use in your own code:
 
-| Parameter | Type       | Description                           |
-| --------- | ---------- | ------------------------------------- |
-| `fields`  | `string[]` | Array of field names to search across |
-
-**Example:**
-
-```typescript
-new QueryFind(Product.find(), req.query)
-  .globalFilter(['name', 'description', 'brand'])
-  .paginate();
+```ts
+import QueryFind, { QueryParams, PaginatedResult } from 'mongoose-query-find';
 ```
 
-**Example URL:**
+```ts
+interface QueryParams {
+  page?: string;
+  limit?: string;
+  sort?: string;
+  fields?: string;
+  q?: string;
+  [key: string]: unknown;
+}
 
-```
-GET /api/products?q=wireless+headphones
-```
-
----
-
-### `sort()`
-
-Sorts results based on the `sort` query parameter. Multiple fields can be comma-separated. Defaults to `-createdAt` (newest first) if no sort is specified.
-
-**Example URLs:**
-
-```
-GET /api/products?sort=price           # ascending by price
-GET /api/products?sort=-price          # descending by price
-GET /api/products?sort=category,-price # category asc, price desc
+interface PaginatedResult<T> {
+  data: T[];
+  total: number;
+  page: number;
+  totalPages: number;
+  limit: number;
+}
 ```
 
 ---
 
-### `limitFields()`
+## Links
 
-Selects specific fields to include or exclude using the `fields` query parameter. Defaults to excluding `__v`.
-
-**Example URLs:**
-
-```
-GET /api/products?fields=name,price,category   # include only these fields
-GET /api/products?fields=-description,-__v     # exclude these fields
-```
-
----
-
-### `paginate()`
-
-Applies skip/limit pagination using `page` and `limit` query parameters.
-
-| Parameter | Default | Description                |
-| --------- | ------- | -------------------------- |
-| `page`    | `1`     | Page number (1-indexed)    |
-| `limit`   | `100`   | Number of results per page |
-
-**Example URL:**
-
-```
-GET /api/products?page=2&limit=20
-```
-
----
-
-### `exec()`
-
-Executes the built query and returns a `Promise<T[]>`.
-
-```typescript
-const results = await features.exec();
-```
-
----
-
-## Query String Parameters
-
-| Parameter           | Description                     | Example              |
-| ------------------- | ------------------------------- | -------------------- |
-| `q`                 | Global search term              | `?q=laptop`          |
-| `sort`              | Comma-separated sort fields     | `?sort=-price,name`  |
-| `fields`            | Comma-separated field selection | `?fields=name,price` |
-| `page`              | Page number for pagination      | `?page=3`            |
-| `limit`             | Results per page                | `?limit=25`          |
-| `[field]`           | Filter by any document field    | `?brand=apple`       |
-| `[field][operator]` | MongoDB operator filter         | `?price[gte]=500`    |
-
----
-
-## Examples
-
-### Combined Usage
-
-```typescript
-// GET /api/products?q=phone&price[gte]=200&sort=-createdAt&fields=name,price&page=1&limit=10
-
-const features = new QueryFind(Product.find(), req.query)
-  .globalFilter(['name', 'description'])
-  .filter()
-  .sort()
-  .limitFields()
-  .paginate();
-
-const products = await features.exec();
-```
-
-### Filtering with Operators
-
-```
-GET /api/products?price[gte]=100&price[lte]=500&stock[gt]=0
-```
-
-```typescript
-// Equivalent to:
-Product.find({ price: { $gte: 100, $lte: 500 }, stock: { $gt: 0 } });
-```
-
-### Pagination
-
-```
-GET /api/products?page=2&limit=15
-```
-
-Skips the first 15 results and returns the next 15.
+- [npm](https://www.npmjs.com/package/mongoose-query-find)
+- [GitHub](https://github.com/jsdev-robin/mongoose-query-find)
+- [Issues](https://github.com/jsdev-robin/mongoose-query-find/issues)
 
 ---
 
 ## License
 
-[ISC](https://opensource.org/licenses/ISC) © [jsdev.robin@gmail.com](mailto:jsdev.robin@gmail.com)
+ISC © [jsdev.robin@gmail.com](mailto:jsdev.robin@gmail.com)
