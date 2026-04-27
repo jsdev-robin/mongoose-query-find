@@ -49,7 +49,10 @@ function sanitize(value: unknown): unknown {
     return value.map(sanitize).filter((v) => v !== undefined);
   }
 
-  if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+  if (
+    typeof value === 'object' &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       const sanitized = sanitize(v);
@@ -78,6 +81,50 @@ function coerceBooleans(obj: Record<string, unknown>): Record<string, unknown> {
   );
 }
 
+// Field names (or suffixes) that should be treated as dates
+const DATE_FIELD_RE = /(^|\.)(createdAt|updatedAt|deletedAt|date|Date)$/;
+
+/**
+ * Recursively walk the filter object and coerce any string value stored
+ * under a date-like key into a proper `Date` instance.
+ *
+ * Handles both plain strings and MongoDB operator objects, e.g.:
+ *   ?createdAt=2024-01-01          → { createdAt: Date }
+ *   ?createdAt[$gte]=2024-01-01    → { createdAt: { $gte: Date } }
+ */
+function coerceDates(
+  obj: Record<string, unknown>,
+  parentKey = '',
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(obj).map(([k, v]) => {
+      const path = parentKey ? `${parentKey}.${k}` : k;
+
+      // Recurse into nested operator objects (e.g. { $gte: '...' })
+      if (
+        v !== null &&
+        typeof v === 'object' &&
+        !Array.isArray(v) &&
+        !(v instanceof Date)
+      ) {
+        // If the parent key is a date field, treat all child values as dates
+        const nested = DATE_FIELD_RE.test(path)
+          ? coerceDates(v as Record<string, unknown>, path)
+          : coerceDates(v as Record<string, unknown>, path);
+        return [k, nested];
+      }
+
+      // Coerce string → Date when key matches a date field pattern
+      if (typeof v === 'string' && DATE_FIELD_RE.test(path)) {
+        const parsed = new Date(v);
+        return [k, isNaN(parsed.getTime()) ? v : parsed];
+      }
+
+      return [k, v];
+    }),
+  );
+}
+
 /**
  * Parse the raw query string into a Mongoose-compatible filter object.
  * Strips reserved keys, sanitizes all values to plain JSON-safe types,
@@ -99,7 +146,7 @@ function buildFilterFromQueryString(raw: QueryParams): Record<string, unknown> {
     JSON.stringify(safe).replace(MONGO_OPERATORS_RE, (m) => `$${m}`),
   ) as Record<string, unknown>;
 
-  return coerceBooleans(withOperators);
+  return coerceDates(coerceBooleans(withOperators));
 }
 
 /**
@@ -124,7 +171,8 @@ function parseSortString(sort: string): Record<string, 1 | -1> {
  *   .filter()
  *   .globalFilter(['name', 'email'])
  *   .sort()
- *   .limitFields('-__v')
+ *   .limitFields('-__v')   // with default
+ *   .limitFields()         // no default — only ?fields= param is honoured
  *   .paginate();
  */
 class QueryFind<
@@ -190,16 +238,22 @@ class QueryFind<
 
   /**
    * Configure field projection.
-   * Uses the `fields` query param when present, otherwise falls back to
-   * `defaultFields`.
    *
-   * @param defaultFields - A space- or comma-separated projection string,
-   *   e.g. `'-password -__v'`.
+   * Priority order:
+   *   1. `?fields=` query param (always wins when present).
+   *   2. `defaultFields` argument (used as fallback when no query param).
+   *   3. No projection at all when both are absent (all fields returned).
+   *
+   * @param defaultFields - Optional space- or comma-separated projection
+   *   string, e.g. `'-password -__v'`. Omit to rely solely on the
+   *   `?fields=` query param.
    */
-  limitFields(defaultFields: string): this {
-    this.selectQuery = this.queryString.fields
-      ? this.queryString.fields.split(',').join(' ')
-      : defaultFields;
+  limitFields(defaultFields?: string): this {
+    if (this.queryString.fields) {
+      this.selectQuery = this.queryString.fields.split(',').join(' ');
+    } else if (defaultFields) {
+      this.selectQuery = defaultFields;
+    }
     return this;
   }
 
