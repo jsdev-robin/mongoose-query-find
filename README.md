@@ -4,7 +4,28 @@
 [![license](https://img.shields.io/npm/l/mongoose-query-find)](https://github.com/jsdev-robin/mongoose-query-find/blob/main/LICENSE)
 [![mongoose peer](https://img.shields.io/badge/mongoose-%5E8%20%7C%7C%20%5E9-brightgreen)](https://mongoosejs.com)
 
-A fluent, chainable query builder for Mongoose that handles filtering, global search, sorting, field projection, and pagination — all driven directly from URL query parameters with zero boilerplate.
+A fluent, chainable query builder for Mongoose that handles filtering, global search, sorting, field projection, population, and pagination — all driven directly from URL query parameters with zero boilerplate.
+
+---
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Constructor](#constructor)
+- [Builder Methods](#builder-methods)
+  - [.filter()](#filter)
+  - [.globalFilter()](#globalfilterfields-string)
+  - [.sort()](#sort)
+  - [.limitFields()](#limitfieldsdefaultfields-string)
+  - [.populate()](#populatepath-string--populateoptions-select-string)
+- [Terminal Method](#terminal-method)
+  - [.paginate()](#paginate)
+- [Query Parameter Reference](#query-parameter-reference)
+- [Full Example (Express)](#full-example-express)
+- [TypeScript Types](#typescript-types)
+- [Links](#links)
+- [License](#license)
 
 ---
 
@@ -78,6 +99,7 @@ Parses the URL query string into a Mongoose filter. Automatically:
 - Strips reserved keys (`page`, `limit`, `sort`, `fields`, `q`)
 - Converts comparison operator names to MongoDB `$` syntax (`gt` → `$gt`, `lte` → `$lte`, etc.)
 - Coerces string booleans to real booleans (`"true"` → `true`, `"false"` → `false`)
+- Coerces date-like string values to `Date` instances for fields named `createdAt`, `updatedAt`, `deletedAt`, `date`, or `Date`
 
 **Supported operators:** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`
 
@@ -124,9 +146,15 @@ Defaults to `{ createdAt: -1 }` when the `sort` param is absent.
 
 ---
 
-### `.limitFields(defaultFields: string)`
+### `.limitFields(defaultFields?: string)`
 
 Controls which fields are returned (projection). Uses the `fields` query param when present, otherwise falls back to `defaultFields`.
+
+**Priority order:**
+
+1. `?fields=` query param — always wins when present
+2. `defaultFields` argument — used as fallback when no query param
+3. No projection at all when both are absent (all fields returned)
 
 ```
 GET /users?fields=name,email,role
@@ -140,6 +168,29 @@ GET /users?fields=name,email,role
 
 ---
 
+### `.populate(path: string | PopulateOptions, select?: string)`
+
+Registers a populate directive. Can be called multiple times to populate multiple paths — each call appends to the internal list. All registered populates are applied inside `paginate()` after the `find` query is built, so core filter / sort / pagination logic is completely untouched.
+
+Accepts the same arguments as Mongoose's own `.populate()`:
+
+```ts
+// Plain path string
+.populate('author')
+
+// Path + select string
+.populate('author', 'name email')
+
+// Full PopulateOptions object
+.populate({ path: 'comments', select: 'text createdAt', match: { visible: true } })
+
+// Multiple calls — each appends to the list
+.populate('author')
+.populate({ path: 'comments', select: 'text createdAt' })
+```
+
+---
+
 ## Terminal Method
 
 ### `.paginate()`
@@ -147,7 +198,7 @@ GET /users?fields=name,email,role
 Executes the query and returns a `Promise<PaginatedResult<T>>`. Makes exactly two database round-trips:
 
 1. `countDocuments` — counts total matching documents (uses index scan)
-2. `find` — fetches the requested page with sort, skip, limit, and projection applied
+2. `find` — fetches the requested page with sort, skip, limit, projection, and any registered populates applied
 
 ```
 GET /users?page=2&limit=20
@@ -197,6 +248,7 @@ export const getUsers = async (req: Request, res: Response) => {
     .globalFilter(['name', 'email', 'username'])
     .sort()
     .limitFields('-password -__v')
+    .populate('role', 'name permissions')
     .paginate();
 
   res.json({
@@ -217,6 +269,9 @@ GET /users?q=alice
 
 # Users older than 25, return only name and email
 GET /users?age[gt]=25&fields=name,email
+
+# Filter by date range
+GET /users?createdAt[$gte]=2024-01-01&createdAt[$lte]=2024-12-31
 
 # Combined: search + filter + sort + pagination
 GET /users?q=john&role=editor&sort=-createdAt&page=1&limit=5

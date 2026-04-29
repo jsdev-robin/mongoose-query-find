@@ -1,4 +1,4 @@
-import { Model, Query, QueryFilter } from 'mongoose';
+import { Model, PopulateOptions, Query, QueryFilter } from 'mongoose';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -107,10 +107,7 @@ function coerceDates(
         !Array.isArray(v) &&
         !(v instanceof Date)
       ) {
-        // If the parent key is a date field, treat all child values as dates
-        const nested = DATE_FIELD_RE.test(path)
-          ? coerceDates(v as Record<string, unknown>, path)
-          : coerceDates(v as Record<string, unknown>, path);
+        const nested = coerceDates(v as Record<string, unknown>, path);
         return [k, nested];
       }
 
@@ -171,8 +168,9 @@ function parseSortString(sort: string): Record<string, 1 | -1> {
  *   .filter()
  *   .globalFilter(['name', 'email'])
  *   .sort()
- *   .limitFields('-__v')   // with default
- *   .limitFields()         // no default — only ?fields= param is honoured
+ *   .limitFields('-__v')
+ *   .populate('author')
+ *   .populate({ path: 'comments', select: 'text createdAt' })
  *   .paginate();
  */
 class QueryFind<
@@ -183,13 +181,16 @@ class QueryFind<
   private readonly queryString: QueryParams;
 
   /** Accumulated Mongoose filter (populated by `filter()` and `globalFilter()`). */
-  private filterQuery: QueryFilter<TRawDocType> = {};
+  private filterQuery: Record<string, unknown> = {};
 
   /** Sort order applied in `paginate()`. */
   private sortQuery: Record<string, 1 | -1> = { createdAt: -1 };
 
   /** Projection string applied in `paginate()`. */
   private selectQuery: string | null = null;
+
+  /** Accumulated populate options — each call to `populate()` appends here. */
+  private populateOptions: PopulateOptions[] = [];
 
   constructor(
     query: Query<TRawDocType[], TRawDocType>,
@@ -257,6 +258,34 @@ class QueryFind<
     return this;
   }
 
+  /**
+   * Register a populate directive. Can be called multiple times to populate
+   * multiple paths — each call appends to the internal list.
+   *
+   * Accepts the same arguments as Mongoose's own `.populate()`:
+   *   - A plain path string:            `.populate('author')`
+   *   - A path + select string:         `.populate('author', 'name email')`
+   *   - A full `PopulateOptions` object: `.populate({ path: 'comments', select: 'text', match: { visible: true } })`
+   *
+   * All registered populates are applied inside `paginate()` after the
+   * `find` query is built — core filter / sort / pagination logic is
+   * completely untouched.
+   *
+   * @param path   - Field path to populate, or a full `PopulateOptions` object.
+   * @param select - Optional field projection for the populated documents
+   *                 (only used when `path` is a plain string).
+   */
+  populate(path: string | PopulateOptions, select?: string): this {
+    if (typeof path === 'string') {
+      const opt: PopulateOptions = { path };
+      if (select) opt.select = select;
+      this.populateOptions.push(opt);
+    } else {
+      this.populateOptions.push(path);
+    }
+    return this;
+  }
+
   // ── Terminal method ─────────────────────────────────────────────────────────
 
   /**
@@ -264,7 +293,8 @@ class QueryFind<
    *
    * Two database round-trips are made:
    *   1. `countDocuments` with the current filter — O(index scan).
-   *   2. `find` with filter, sort, skip, limit, and projection.
+   *   2. `find` with filter, sort, skip, limit, projection, and any
+   *      registered populates.
    *
    * If the requested page exceeds `totalPages` (e.g. after a deletion),
    * page 1 is returned instead so the caller always receives valid data.
@@ -289,6 +319,11 @@ class QueryFind<
 
     if (this.selectQuery) {
       findQuery.select(this.selectQuery);
+    }
+
+    // ── 3. Apply populates (if any) ────────────────────────────────────────
+    for (const opt of this.populateOptions) {
+      findQuery.populate(opt);
     }
 
     const data = await findQuery.exec();
