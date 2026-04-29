@@ -89,7 +89,7 @@ const DATE_FIELD_RE = /(^|\.)(createdAt|updatedAt|deletedAt|date|Date)$/;
  * under a date-like key into a proper `Date` instance.
  *
  * Handles both plain strings and MongoDB operator objects, e.g.:
- *   ?createdAt=2024-01-01          → { createdAt: Date }
+ *   ?createdAt=2024-01-01          → { createdAt: { $gte: Date, $lt: Date } }
  *   ?createdAt[$gte]=2024-01-01    → { createdAt: { $gte: Date } }
  */
 function coerceDates(
@@ -114,7 +114,18 @@ function coerceDates(
       // Coerce string → Date when key matches a date field pattern
       if (typeof v === 'string' && DATE_FIELD_RE.test(path)) {
         const parsed = new Date(v);
-        return [k, isNaN(parsed.getTime()) ? v : parsed];
+        if (isNaN(parsed.getTime())) return [k, v];
+
+        // If it's a plain date string (no time component), convert to a
+        // $gte/$lt range so it matches all documents within that day.
+        if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+          const start = new Date(v);
+          const end = new Date(start);
+          end.setUTCDate(end.getUTCDate() + 1);
+          return [k, { $gte: start, $lt: end }];
+        }
+
+        return [k, parsed];
       }
 
       return [k, v];
