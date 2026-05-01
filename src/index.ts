@@ -174,8 +174,15 @@ function parseSortString(sort: string): Record<string, 1 | -1> {
  * then paginates the result using two native `countDocuments` + `find` calls
  * (no aggregation pipeline required).
  *
+ * Base query conditions passed to the constructor (e.g. `Model.find({ role: 'admin' })`)
+ * are automatically preserved and merged with any additional filters applied
+ * via `.filter()` or `.globalFilter()`.
+ *
  * @example
- * const result = await new QueryFind(Model.find(), req.query)
+ * const result = await new QueryFind(
+ *   UserModel.find({ linkedTo: req.self._id, role: { $in: ROLES } }),
+ *   req.query
+ * )
  *   .filter()
  *   .globalFilter(['name', 'email'])
  *   .sort()
@@ -191,7 +198,7 @@ class QueryFind<
   private readonly model: TModelType;
   private readonly queryString: QueryParams;
 
-  /** Accumulated Mongoose filter (populated by `filter()` and `globalFilter()`). */
+  /** Accumulated Mongoose filter (populated by constructor, `filter()`, and `globalFilter()`). */
   private filterQuery: Record<string, unknown> = {};
 
   /** Sort order applied in `paginate()`. */
@@ -209,11 +216,20 @@ class QueryFind<
   ) {
     this.model = query.model as unknown as TModelType;
     this.queryString = queryString;
+
+    // so they are never lost when .filter() builds additional URL-param filters.
+    const baseFilter = query.getFilter() as Record<string, unknown>;
+    if (baseFilter && Object.keys(baseFilter).length > 0) {
+      this.filterQuery = { ...baseFilter };
+    }
   }
 
   // ── Builder methods ─────────────────────────────────────────────────────────
 
-  /** Parse the URL query string into a Mongoose filter. */
+  /**
+   * Parse the URL query string into a Mongoose filter and merge it on top
+   * of any base query conditions set in the constructor.
+   */
   filter(): this {
     const parsed = buildFilterFromQueryString(this.queryString);
     this.filterQuery = {
