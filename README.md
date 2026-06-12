@@ -14,8 +14,10 @@ A fluent, chainable query builder for Mongoose that handles filtering, global se
 - [Quick Start](#quick-start)
 - [Constructor](#constructor)
 - [Builder Methods](#builder-methods)
+  - [.allowFields()](#allowfieldsfields-string)
   - [.filter()](#filter)
-  - [.globalFilter()](#globalfilterfields-string)
+  - [.where()](#whereconditions)
+  - [.globalSearch()](#globalsearchfields-string)
   - [.sort()](#sort)
   - [.limitFields()](#limitfieldsdefaultfields-string)
   - [.populate()](#populatepath-string--populateoptions-select-string)
@@ -24,6 +26,7 @@ A fluent, chainable query builder for Mongoose that handles filtering, global se
 - [Query Parameter Reference](#query-parameter-reference)
 - [Full Example (Express)](#full-example-express)
 - [TypeScript Types](#typescript-types)
+- [Security](#security)
 - [Links](#links)
 - [License](#license)
 
@@ -50,12 +53,14 @@ pnpm add mongoose-query-find
 ## Quick Start
 
 ```ts
-import QueryFind from 'mongoose-query-find';
+import { queryFind } from 'mongoose-query-find';
 import UserModel from './models/user';
 
-const result = await new QueryFind(UserModel.find(), req.query)
+const result = await queryFind(UserModel.find(), req.query)
+  .allowFields(['name', 'email', 'role', 'createdAt'])
+  .where({ deletedAt: null })
   .filter()
-  .globalFilter(['name', 'email'])
+  .globalSearch(['name', 'email'])
   .sort()
   .limitFields('-password -__v')
   .paginate();
@@ -69,7 +74,9 @@ const result = await new QueryFind(UserModel.find(), req.query)
   "total": 84,
   "page": 2,
   "totalPages": 9,
-  "limit": 10
+  "limit": 10,
+  "hasNextPage": true,
+  "hasPrevPage": true
 }
 ```
 
@@ -78,19 +85,46 @@ const result = await new QueryFind(UserModel.find(), req.query)
 ## Constructor
 
 ```ts
-new QueryFind(query, queryString);
+new QueryFind(query, queryString, options?);
+// or use the factory function (recommended):
+queryFind(query, queryString, options?);
 ```
 
-| Parameter     | Type                                | Description                                   |
-| ------------- | ----------------------------------- | --------------------------------------------- |
-| `query`       | `Query<TRawDocType[], TRawDocType>` | A Mongoose query, e.g. `Model.find()`         |
-| `queryString` | `QueryParams`                       | The parsed URL query object, e.g. `req.query` |
+| Parameter     | Type                                | Description                                           |
+| ------------- | ----------------------------------- | ----------------------------------------------------- |
+| `query`       | `Query<TRawDocType[], TRawDocType>` | A Mongoose query, e.g. `Model.find()`                 |
+| `queryString` | `QueryParams`                       | The parsed URL query object, e.g. `req.query`         |
+| `options`     | `QueryFindOptions` _(optional)_     | Configuration options (see [Options](#options) below) |
+
+### Options
+
+| Option      | Type     | Default | Description                                                            |
+| ----------- | -------- | ------- | ---------------------------------------------------------------------- |
+| `maxTimeMS` | `number` | `5000`  | Max milliseconds MongoDB may spend on each query. Pass `0` to disable. |
 
 ---
 
 ## Builder Methods
 
-All builder methods return `this`, so they are fully chainable in any order.
+All builder methods return `this` and are fully chainable. The recommended call order is:
+
+```
+allowFields → where → filter → globalSearch → sort → limitFields → populate → paginate
+```
+
+---
+
+### `.allowFields(fields: string[])`
+
+Declares which fields may appear in URL filters, sort parameters, and field projections. Acts as an allowlist — any field not listed is silently stripped from client input before it reaches MongoDB.
+
+**Call this before `.filter()`, `.sort()`, and `.limitFields()`.**
+
+```ts
+.allowFields(['name', 'email', 'role', 'createdAt'])
+```
+
+---
 
 ### `.filter()`
 
@@ -98,8 +132,9 @@ Parses the URL query string into a Mongoose filter. Automatically:
 
 - Strips reserved keys (`page`, `limit`, `sort`, `fields`, `q`)
 - Converts comparison operator names to MongoDB `$` syntax (`gt` → `$gt`, `lte` → `$lte`, etc.)
-- Coerces string booleans to real booleans (`"true"` → `true`, `"false"` → `false`)
-- Coerces date-like string values to `Date` instances for fields named `createdAt`, `updatedAt`, `deletedAt`, `date`, or `Date`
+- Recursively coerces string booleans to real booleans (`"true"` → `true`, `"false"` → `false`)
+- Coerces date-like strings to `Date` instances for fields named `createdAt`, `updatedAt`, `deletedAt`, `date`, `birthDate`, or `expiresAt`
+- Recursively validates and rejects banned operators (`$where`, `$expr`, `$function`, etc.)
 
 **Supported operators:** `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`
 
@@ -114,24 +149,40 @@ GET /users?age[gte]=18&isActive=true&role=admin
 
 ---
 
-### `.globalFilter(fields: string[])`
+### `.where(conditions)`
 
-Adds a case-insensitive `$or` regex search across the specified fields when the `q` query parameter is present. If `q` is absent, this method is a no-op.
+Applies mandatory server-side conditions that the URL **cannot override**. Use this for multi-tenancy, soft-delete exclusion, and any security-critical constraints.
+
+```ts
+.where({ orgId: req.user.orgId, deletedAt: null })
+```
+
+> `.where()` always wins — conditions are merged after `.filter()` and will overwrite any conflicting URL params.
+
+---
+
+### `.globalSearch(fields: string[])`
+
+Adds a case-insensitive `$or` regex search across the specified fields when the `?q=` query parameter is present. If `q` is absent or exceeds 200 characters, this method is a no-op.
+
+Search terms are regex-escaped to prevent ReDoS attacks.
 
 ```
 GET /users?q=john
 ```
 
 ```ts
-.globalFilter(['name', 'email'])
+.globalSearch(['name', 'email'])
 // → { $or: [{ name: /john/i }, { email: /john/i }] }
 ```
+
+If a `$or` clause already exists in the filter (e.g. from `.filter()`), both are safely merged under `$and`.
 
 ---
 
 ### `.sort()`
 
-Applies sort order from the `sort` query parameter. Prefix a field with `-` for descending order. Multiple fields are comma-separated.
+Applies sort order from the `?sort=` query parameter. Prefix a field with `-` for descending order. Multiple fields are comma-separated, capped at 5 fields.
 
 ```
 GET /users?sort=-createdAt,name
@@ -142,19 +193,21 @@ GET /users?sort=-createdAt,name
 // → sorts by createdAt DESC, then name ASC
 ```
 
-Defaults to `{ createdAt: -1 }` when the `sort` param is absent.
+Defaults to `{ createdAt: -1 }` when the `sort` param is absent. Fields not in the allowlist are silently skipped.
 
 ---
 
 ### `.limitFields(defaultFields?: string)`
 
-Controls which fields are returned (projection). Uses the `fields` query param when present, otherwise falls back to `defaultFields`.
+Controls which fields are returned (projection). Uses the `?fields=` query param when present, otherwise falls back to `defaultFields`.
+
+Fields requested via `?fields=` are filtered against the allowlist — clients cannot project sensitive fields like `password` or `resetToken`.
 
 **Priority order:**
 
-1. `?fields=` query param — always wins when present
+1. `?fields=` query param — always wins when present (allowlist-filtered)
 2. `defaultFields` argument — used as fallback when no query param
-3. No projection at all when both are absent (all fields returned)
+3. No projection when both are absent (all fields returned)
 
 ```
 GET /users?fields=name,email,role
@@ -170,7 +223,7 @@ GET /users?fields=name,email,role
 
 ### `.populate(path: string | PopulateOptions, select?: string)`
 
-Registers a populate directive. Can be called multiple times to populate multiple paths — each call appends to the internal list. All registered populates are applied inside `paginate()` after the `find` query is built, so core filter / sort / pagination logic is completely untouched.
+Registers a populate directive. Chainable — each call appends to the internal list. All registered populates are applied inside `paginate()`.
 
 Accepts the same arguments as Mongoose's own `.populate()`:
 
@@ -184,7 +237,7 @@ Accepts the same arguments as Mongoose's own `.populate()`:
 // Full PopulateOptions object
 .populate({ path: 'comments', select: 'text createdAt', match: { visible: true } })
 
-// Multiple calls — each appends to the list
+// Multiple calls — fully chainable
 .populate('author')
 .populate({ path: 'comments', select: 'text createdAt' })
 ```
@@ -195,10 +248,13 @@ Accepts the same arguments as Mongoose's own `.populate()`:
 
 ### `.paginate()`
 
-Executes the query and returns a `Promise<PaginatedResult<T>>`. Makes exactly two database round-trips:
+Executes the query and returns a `Promise<PaginatedResult<T>>`.
 
-1. `countDocuments` — counts total matching documents (uses index scan)
-2. `find` — fetches the requested page with sort, skip, limit, projection, and any registered populates applied
+- `countDocuments` and `find` run **in parallel** via `Promise.all` (saves one network round-trip).
+- Uses `estimatedDocumentCount` as a fast-path when no filter is applied (O(1) vs O(n)).
+- `.lean()` is applied for ~3–5× faster reads on plain object responses.
+- `maxTimeMS` is applied to both count and find to prevent runaway collection scans.
+- If the requested `page` exceeds `totalPages` (e.g. after a deletion), page `1` is returned automatically.
 
 ```
 GET /users?page=2&limit=20
@@ -208,30 +264,30 @@ GET /users?page=2&limit=20
 
 ```ts
 {
-  data: T[];         // Documents for the current page
-  total: number;     // Total matching documents across all pages
-  page: number;      // Current page (auto-corrects to 1 if out of range)
+  data: T[];
+  total: number;        // Total matching documents across all pages
+  page: number;         // Current page (auto-corrects to 1 if out of range)
   totalPages: number;
   limit: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
 }
 ```
 
-> If the requested `page` exceeds `totalPages` (e.g. after a deletion), page `1` is returned automatically so the caller always receives valid data.
-
-**Defaults:** `page=1`, `limit=10`
+**Defaults:** `page=1`, `limit=10`, max `limit=100`.
 
 ---
 
 ## Query Parameter Reference
 
-| Parameter   | Example                   | Description                                       |
-| ----------- | ------------------------- | ------------------------------------------------- |
-| `page`      | `?page=3`                 | Page number (default: `1`, min: `1`)              |
-| `limit`     | `?limit=25`               | Documents per page (default: `10`, min: `1`)      |
-| `sort`      | `?sort=-createdAt,name`   | Sort fields; prefix `-` for descending            |
-| `fields`    | `?fields=name,email`      | Comma-separated fields to include in the response |
-| `q`         | `?q=john`                 | Global search term (used by `.globalFilter()`)    |
-| _(any key)_ | `?role=admin&age[gte]=18` | Field-level filters processed by `.filter()`      |
+| Parameter   | Example                   | Description                                            |
+| ----------- | ------------------------- | ------------------------------------------------------ |
+| `page`      | `?page=3`                 | Page number (default: `1`, min: `1`)                   |
+| `limit`     | `?limit=25`               | Documents per page (default: `10`, max: `100`)         |
+| `sort`      | `?sort=-createdAt,name`   | Sort fields; prefix `-` for descending (max: 5 fields) |
+| `fields`    | `?fields=name,email`      | Comma-separated fields to include in the response      |
+| `q`         | `?q=john`                 | Global search term (max: 200 chars)                    |
+| _(any key)_ | `?role=admin&age[gte]=18` | Field-level filters processed by `.filter()`           |
 
 ---
 
@@ -239,22 +295,21 @@ GET /users?page=2&limit=20
 
 ```ts
 import { Request, Response } from 'express';
-import QueryFind from 'mongoose-query-find';
+import { queryFind } from 'mongoose-query-find';
 import UserModel from '../models/user';
 
 export const getUsers = async (req: Request, res: Response) => {
-  const result = await new QueryFind(UserModel.find(), req.query)
+  const result = await queryFind(UserModel.find(), req.query)
+    .allowFields(['name', 'email', 'username', 'role', 'isActive', 'createdAt'])
+    .where({ orgId: req.user.orgId, deletedAt: null })
     .filter()
-    .globalFilter(['name', 'email', 'username'])
+    .globalSearch(['name', 'email', 'username'])
     .sort()
     .limitFields('-password -__v')
     .populate('role', 'name permissions')
     .paginate();
 
-  res.json({
-    status: 'success',
-    ...result,
-  });
+  res.json({ status: 'success', ...result });
 };
 ```
 
@@ -270,8 +325,11 @@ GET /users?q=alice
 # Users older than 25, return only name and email
 GET /users?age[gt]=25&fields=name,email
 
+# Filter by exact date
+GET /users?createdAt=2024-06-01
+
 # Filter by date range
-GET /users?createdAt[$gte]=2024-01-01&createdAt[$lte]=2024-12-31
+GET /users?createdAt[gte]=2024-01-01&createdAt[lte]=2024-12-31
 
 # Combined: search + filter + sort + pagination
 GET /users?q=john&role=editor&sort=-createdAt&page=1&limit=5
@@ -281,10 +339,16 @@ GET /users?q=john&role=editor&sort=-createdAt&page=1&limit=5
 
 ## TypeScript Types
 
-Both types are exported and available for use in your own code:
+All types are exported:
 
 ```ts
-import QueryFind, { QueryParams, PaginatedResult } from 'mongoose-query-find';
+import {
+  queryFind,
+  QueryFind,
+  QueryParams,
+  PaginatedResult,
+  QueryFindOptions,
+} from 'mongoose-query-find';
 ```
 
 ```ts
@@ -303,8 +367,30 @@ interface PaginatedResult<T> {
   page: number;
   totalPages: number;
   limit: number;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+}
+
+interface QueryFindOptions {
+  maxTimeMS?: number; // default: 5000
 }
 ```
+
+---
+
+## Security
+
+| Protection                  | Detail                                                                                   |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| **NoSQL injection**         | Allowlist enforced on filters, sort, and projection via `.allowFields()`                 |
+| **Banned operators**        | `$where`, `$expr`, `$function`, and others are rejected recursively at any nesting depth |
+| **ReDoS**                   | Search terms are regex-escaped before compilation                                        |
+| **Oversized search**        | `?q=` capped at 200 characters                                                           |
+| **Deep nesting DoS**        | Filter object nesting capped at depth 5                                                  |
+| **Page size DoS**           | `limit` hard-capped at 100                                                               |
+| **Sort abuse**              | Sort fields hard-capped at 5                                                             |
+| **Runaway queries**         | `maxTimeMS` applied to both count and find (default: 5s)                                 |
+| **Sensitive field leakage** | `?fields=` projection stripped against allowlist                                         |
 
 ---
 
