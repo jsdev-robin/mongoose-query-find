@@ -12,6 +12,8 @@
  *  - Allowlist-based field filtering on filters, sort, AND projection (NoSQL injection prevention)
  *  - Deep recursive operator validation (catches nested $where, $expr, etc.)
  *  - Deep recursive boolean coercion (handles nested query objects)
+ *  - Deep recursive operator-key coercion (eq/ne/gt/... → $eq/$ne/$gt/...), applied
+ *    ONLY to object keys — never to string values (fixes JSON-string regex bug)
  *  - estimatedDocumentCount fast-path when no filter is applied
  *  - Query timeout via maxTimeMS (prevents runaway queries)
  *  - Structured error types for clean upstream handling
@@ -53,11 +55,21 @@ const DATE_FIELD_RE =
 const PLAIN_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
- * Returns a fresh RegExp every call — avoids the stateful lastIndex bug
- * that occurs when a /g regex is stored as a module-level constant and
- * reused across calls.
+ * Mongo comparison/array operator names accepted WITHOUT a leading "$" in
+ * the URL query string (e.g. `?age[gte]=18` → `{ age: { $gte: 18 } }`).
+ * Only ever applied to OBJECT KEYS during the recursive coercion pass —
+ * never to string values — so a value like `?name=eq` is left untouched.
  */
-const MONGO_OP_RE = (): RegExp => /\b(eq|ne|gt|gte|lt|lte|in|nin)\b/g;
+const COERCIBLE_OPS = new Set([
+  'eq',
+  'ne',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'in',
+  'nin',
+]);
 
 const DEFAULT_SORT = Object.freeze<Record<string, 1 | -1>>({ createdAt: -1 });
 
@@ -185,6 +197,43 @@ function enforceAllowlist(
     if (k.startsWith('$') || allowedFields.has(k)) out[k] = v;
   }
   return out;
+}
+
+// ─── Operator-key coercion ────────────────────────────────────────────────────
+
+/**
+ * Recursively walks a parsed (sanitized) object/array tree and rewrites
+ * plain operator-like KEYS (eq, ne, gt, gte, lt, lte, in, nin) to their
+ * "$"-prefixed Mongo equivalents (e.g. `{ age: { gte: 18 } }` →
+ * `{ age: { $gte: 18 } }`).
+ *
+ * This replaces the previous implementation, which ran a regex over the
+ * JSON-stringified filter and rewrote ANY occurrence of these words —
+ * including inside string VALUES (e.g. `?name=eq` or `?status=in`),
+ * silently corrupting user data into Mongo operators. By operating on the
+ * parsed object tree and only ever touching object KEYS, string values are
+ * never inspected or mutated.
+ */
+function coerceOperatorKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => coerceOperatorKeys(item));
+  }
+
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    !(value instanceof Date) &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const newKey = COERCIBLE_OPS.has(k) ? `$${k}` : k;
+      out[newKey] = coerceOperatorKeys(v);
+    }
+    return out;
+  }
+
+  return value;
 }
 
 // ─── Type coercion ────────────────────────────────────────────────────────────
@@ -325,9 +374,10 @@ function buildFilter(
 
   const safe = sanitize(stripped) as Record<string, unknown>;
 
-  const withOps = JSON.parse(
-    JSON.stringify(safe).replace(MONGO_OP_RE(), (m) => `$${m}`),
-  ) as Record<string, unknown>;
+  // Rewrite bare operator keys (eq/ne/gt/...) to "$"-prefixed Mongo
+  // operators. Operates on parsed object KEYS only — string values
+  // (e.g. ?status=in, ?name=eq) are never touched.
+  const withOps = coerceOperatorKeys(safe) as Record<string, unknown>;
 
   const coerced = coerceDates(
     coerceBooleans(withOps) as Record<string, unknown>,
@@ -414,6 +464,9 @@ function sanitizeProjection(
  *  - Nesting depth capped at 5; page size capped at 100; sort fields capped at 5.
  *  - Search terms are regex-escaped (ReDoS prevention) and length-capped at 200 chars.
  *  - ?fields= projection is allowlist-filtered to prevent sensitive field leakage.
+ *  - Operator-key coercion (eq/gte/in/...) only touches object KEYS, never string
+ *    VALUES — a search like ?name=eq or ?status=in cannot be corrupted into a
+ *    Mongo operator.
  *  - All queries run with maxTimeMS to prevent runaway collection scans.
  */
 export class QueryFind<
@@ -491,18 +544,23 @@ export class QueryFind<
       [field]: { $regex: escaped, $options: 'i' },
     }));
 
-    const existingOr = this._filter.$or as unknown[] | undefined;
-
-    if (existingOr?.length) {
-      const existingAnd = (this._filter.$and as unknown[]) ?? [];
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { $or, $and, ...rest } = this._filter;
+    // Always AND the search clause with whatever conditions are already
+    // present (top-level fields from .where()/.filter(), or existing
+    // $or/$and). This avoids the bug where a top-level field that
+    // happens to also be one of the `fields` passed here (e.g.
+    // ?status=active combined with .globalSearch(['status','name']))
+    // would sit alongside $or and be implicitly ANDed with it — making
+    // the search match only documents where `status` is BOTH exactly
+    // "active" AND matches the regex, silently excluding matches on
+    // `name`. Wrapping the existing filter as one branch of $and
+    // preserves all prior conditions intact while ORing across the
+    // search fields independently.
+    if (Object.keys(this._filter).length > 0) {
       this._filter = {
-        ...rest,
-        $and: [...existingAnd, { $or: existingOr }, { $or: searchOr }],
+        $and: [this._filter, { $or: searchOr }],
       };
     } else {
-      this._filter.$or = searchOr as MFilter<TRawDocType>['$or'];
+      this._filter = { $or: searchOr as MFilter<TRawDocType>['$or'] };
     }
 
     return this;
@@ -584,11 +642,6 @@ export class QueryFind<
     const hasFilter = Object.keys(this._filter).length > 0;
     const { maxTimeMS } = this.options;
 
-    // ── First pass: count + first-page find in parallel ──────────────────────
-    // We need total before we can compute safePage, so we run a first-pass
-    // find with page=1 while counting. If safePage turns out to be 1 (common
-    // case) we reuse the result; otherwise we re-run with the correct skip.
-
     const buildFind = (skip: number) => {
       const q = this.model
         .find(mongoFilter)
@@ -608,7 +661,6 @@ export class QueryFind<
           .maxTimeMS(maxTimeMS) as unknown as Promise<number>)
       : (this.model.estimatedDocumentCount() as unknown as Promise<number>);
 
-    // Run count and page-1 find in parallel
     const [total, firstPageData] = await Promise.all([
       countQuery,
       buildFind(0),
@@ -617,7 +669,6 @@ export class QueryFind<
     const totalPages = Math.max(Math.ceil(total / limit), 1);
     const safePage = page > totalPages ? 1 : page;
 
-    // If the requested page is page 1 (or was clamped to 1), reuse the result
     if (safePage === 1) {
       return {
         data: firstPageData,
@@ -630,7 +681,6 @@ export class QueryFind<
       };
     }
 
-    // Otherwise fetch the correct page (skip already known)
     const data = await buildFind((safePage - 1) * limit);
 
     return {
