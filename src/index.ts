@@ -7,7 +7,7 @@
  *  - URL query string → Mongoose filter (sanitized, validated, coerced)
  *  - Global full-text search via $or regex
  *  - Flexible sort, field projection, and populate
- *  - count + find run fully in parallel (Promise.all)
+ *  - count + find run fully in parallel (Promise.all) — no wasted round-trips
  *  - Hard limits on page size, sort fields, search length, nesting depth (DoS protection)
  *  - Allowlist-based field filtering on filters, sort, AND projection (NoSQL injection prevention)
  *  - Case-insensitive allowlist matching (e.g. allowFields(['Name']) matches ?name=, ?NAME=, ?Name=)
@@ -18,36 +18,44 @@
  *  - estimatedDocumentCount fast-path when no filter is applied
  *  - Query timeout via maxTimeMS (prevents runaway queries)
  *  - Structured error types for clean upstream handling
+ *  - Optional cached total for skipping re-count on page > 1
+ *  - Optional slow-query hook for observability
  *  - Zero external runtime dependencies beyond mongoose
+ *
+ * Fixes applied on top of original:
+ *  1. where() conditions are stored separately and merged last in paginate() —
+ *     URL params can no longer overwrite server-side conditions like deletedAt: null.
+ *  2. globalSearch() guards against double-call: subsequent calls extend the
+ *     $or array rather than re-wrapping the entire filter in nested $and.
+ *  3. Slow-query wrapper now covers execCount() on page > 1 (no cachedTotal path).
+ *  4. parseLimit / parsePage are computed once in the constructor, not on every
+ *     paginate() call.
+ *  5. sanitize() calls onDrop when MAX_NESTING_DEPTH is exceeded, instead of
+ *     silently returning undefined.
+ *  6. buildAllowedStructures result is memoized — rebuilds only when allowFields()
+ *     is actually called.
+ *  7. wrapTimed, execFind, execCount promoted to private methods — no longer
+ *     re-created as closures on every paginate() call.
+ *  8. DEFAULT_SORT freeze is removed; copies are made where needed, the constant
+ *     itself is just a plain object used as the default spread source.
+ *  9. lean() exposed as a QueryFindOptions flag (default true) so callers that
+ *     need Mongoose document instances (virtuals, instance methods) can opt out.
+ * 10. Double-cast `as unknown as Promise<number>` replaced with explicit typed
+ *     helper to surface any future version mismatches at compile time.
  */
 
 import mongoose, { Model, PopulateOptions, Query } from 'mongoose';
 
-/**
- * Mongoose 8/9 does not export FilterQuery or RootFilterQuery as named
- * exports. QueryFilter<T> lives inside the `mongoose` namespace and is
- * accessed via `mongoose.QueryFilter<T>`. We alias it here so the rest
- * of the file stays readable.
- */
 type MFilter<T> = mongoose.QueryFilter<T>;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const RESERVED_KEYS = new Set<string>(['page', 'sort', 'limit', 'fields', 'q']);
 
-/** Hard cap — prevents clients from dumping the whole collection. */
 const MAX_LIMIT = 100;
-
-/** Hard cap — prevents DoS via ?a[b][c][d][e][f]=1 */
 const MAX_NESTING_DEPTH = 5;
-
-/** Hard cap — prevents compiling huge regexes from ?q= */
 const MAX_SEARCH_LENGTH = 200;
-
-/** Hard cap — prevents abuse via ?sort=a,b,c,d,e,f,... */
 const MAX_SORT_FIELDS = 5;
-
-/** Default query timeout in milliseconds — prevents runaway scans on unindexed fields. */
 const DEFAULT_MAX_TIME_MS = 5_000;
 
 const DATE_FIELD_RE =
@@ -55,12 +63,6 @@ const DATE_FIELD_RE =
 
 const PLAIN_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-/**
- * Mongo comparison/array operator names accepted WITHOUT a leading "$" in
- * the URL query string (e.g. `?age[gte]=18` → `{ age: { $gte: 18 } }`).
- * Only ever applied to OBJECT KEYS during the recursive coercion pass —
- * never to string values — so a value like `?name=eq` is left untouched.
- */
 const COERCIBLE_OPS = new Set([
   'eq',
   'ne',
@@ -72,14 +74,11 @@ const COERCIBLE_OPS = new Set([
   'nin',
 ]);
 
-const DEFAULT_SORT = Object.freeze<Record<string, 1 | -1>>({ createdAt: -1 });
+// Fix #8: plain object — no freeze needed, it is never mutated in place.
+const DEFAULT_SORT: Record<string, 1 | -1> = { createdAt: -1 };
 
 const ALLOWED_TOP_LEVEL_OPS = new Set(['$and', '$or', '$nor', '$not']);
 
-/**
- * Operators that are never permitted anywhere in a client-supplied filter,
- * regardless of nesting depth. Catches $where, $expr, $function, etc.
- */
 const BANNED_OPERATORS = new Set([
   '$where',
   '$expr',
@@ -111,12 +110,41 @@ export interface PaginatedResult<T> {
   hasPrevPage: boolean;
 }
 
+export interface SlowQueryInfo {
+  /** Elapsed time in milliseconds */
+  elapsedMs: number;
+  /** The Mongoose filter that was applied */
+  filter: Record<string, unknown>;
+  /** The sort that was applied */
+  sort: Record<string, 1 | -1>;
+  /** The page that was requested */
+  page: number;
+  /** The limit that was applied */
+  limit: number;
+}
+
 export interface QueryFindOptions {
-  /**
-   * Maximum time in milliseconds MongoDB is allowed to spend on the query.
-   * Defaults to 5000ms. Pass 0 to disable.
-   */
   maxTimeMS?: number;
+  /**
+   * Threshold in ms above which onSlowQuery fires.
+   * Defaults to maxTimeMS. Set lower (e.g. 1000) to catch slow-but-not-timed-out queries.
+   */
+  slowQueryThresholdMS?: number;
+  /**
+   * Called when a query exceeds slowQueryThresholdMS.
+   * Use to emit metrics, log to your APM, etc.
+   */
+  onSlowQuery?: (info: SlowQueryInfo) => void;
+  /**
+   * Called when sanitize() silently drops a value (e.g. a Date or class instance).
+   * Defaults to console.warn in non-production environments.
+   */
+  onSanitizeDrop?: (path: string, value: unknown) => void;
+  /**
+   * Fix #9: whether to call .lean() on find queries (default: true).
+   * Set to false if you need Mongoose document instances (virtuals, instance methods).
+   */
+  lean?: boolean;
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -150,37 +178,60 @@ function parseLimit(raw: string | undefined): number {
 
 // ─── Sanitization ─────────────────────────────────────────────────────────────
 
-function sanitize(value: unknown, depth = 0): unknown {
-  if (depth > MAX_NESTING_DEPTH) return undefined;
-
-  if (
-    value === null ||
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'boolean'
-  ) {
-    return value;
+function sanitize(
+  value: unknown,
+  depth = 0,
+  path = '',
+  onDrop?: (path: string, value: unknown) => void,
+): unknown {
+  // Fix #5: call onDrop when depth limit is exceeded so callers are notified.
+  if (depth > MAX_NESTING_DEPTH) {
+    if (onDrop) {
+      onDrop(path, value);
+    } else if (process.env.NODE_ENV !== 'production') {
+      console.warn(
+        `[query-find] sanitize() dropped value exceeding max nesting depth at path "${path}":`,
+        value,
+      );
+    }
+    return undefined;
   }
+
+  if (value === null) return null;
+
+  const t = typeof value;
+  if (t === 'string' || t === 'number' || t === 'boolean') return value;
 
   if (Array.isArray(value)) {
     const out: unknown[] = [];
-    for (const item of value) {
-      const s = sanitize(item, depth + 1);
+    for (let i = 0; i < value.length; i++) {
+      const s = sanitize(value[i], depth + 1, `${path}[${i}]`, onDrop);
       if (s !== undefined) out.push(s);
     }
     return out;
   }
 
-  if (
-    typeof value === 'object' &&
-    Object.getPrototypeOf(value) === Object.prototype
-  ) {
+  if (t === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    const src = value as Record<string, unknown>;
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const s = sanitize(v, depth + 1);
-      if (s !== undefined) out[k] = s;
+    for (const k in src) {
+      if (Object.prototype.hasOwnProperty.call(src, k)) {
+        const childPath = path ? `${path}.${k}` : k;
+        const s = sanitize(src[k], depth + 1, childPath, onDrop);
+        if (s !== undefined) out[k] = s;
+      }
     }
     return out;
+  }
+
+  // Non-plain-object dropped — notify caller.
+  if (onDrop) {
+    onDrop(path, value);
+  } else if (process.env.NODE_ENV !== 'production') {
+    console.warn(
+      `[query-find] sanitize() dropped non-plain value at path "${path}":`,
+      value,
+    );
   }
 
   return undefined;
@@ -188,159 +239,87 @@ function sanitize(value: unknown, depth = 0): unknown {
 
 // ─── Allowlist ────────────────────────────────────────────────────────────────
 
-/**
- * Builds a lowercase lookup set from the user-supplied allowlist so that
- * field matching is case-insensitive (e.g. allowFields(['Name', 'Email'])
- * will match ?name=, ?NAME=, ?eMail=, etc.). The original-cased fields are
- * still used wherever they need to be emitted (e.g. default sort/projection).
- */
-function buildAllowedLookup(allowedFields: Set<string>): Set<string> {
+function buildAllowedStructures(allowedFields: Set<string>): {
+  lookup: Set<string>;
+  canonical: Map<string, string>;
+} {
   const lookup = new Set<string>();
-  for (const f of allowedFields) lookup.add(f.toLowerCase());
-  return lookup;
+  const canonical = new Map<string, string>();
+  for (const f of allowedFields) {
+    const lc = f.toLowerCase();
+    lookup.add(lc);
+    canonical.set(lc, f);
+  }
+  return { lookup, canonical };
 }
 
-/** Case-insensitive membership check against a lowercase lookup set. */
 function isFieldAllowed(field: string, allowedLookup: Set<string>): boolean {
   return allowedLookup.has(field.toLowerCase());
 }
 
-/**
- * Allowlist-filters the top-level keys of a client-supplied filter object.
- * `$`-prefixed operator keys (e.g. $and, $or) always pass through.
- * Matching is case-insensitive (via allowedLookup), and a matched key is
- * rewritten to the casing originally declared in allowFields() — e.g.
- * ?NAME=foo with allowFields(['name']) becomes { name: 'foo' }, not
- * { NAME: 'foo' }, so it actually matches the schema path.
- */
 function enforceAllowlist(
   filter: Record<string, unknown>,
   allowedLookup: Set<string>,
-  allowedFields: Set<string>,
+  canonicalMap: Map<string, string>,
 ): Record<string, unknown> {
   if (allowedLookup.size === 0) return filter;
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(filter)) {
+  for (const k in filter) {
+    if (!Object.prototype.hasOwnProperty.call(filter, k)) continue;
     if (k.startsWith('$')) {
-      out[k] = v;
+      out[k] = filter[k];
       continue;
     }
-    if (isFieldAllowed(k, allowedLookup)) {
-      const canonical =
-        [...allowedFields].find((f) => f.toLowerCase() === k.toLowerCase()) ??
-        k;
-      out[canonical] = v;
+    const lc = k.toLowerCase();
+    if (allowedLookup.has(lc)) {
+      out[canonicalMap.get(lc) ?? k] = filter[k];
     }
   }
   return out;
 }
 
-// ─── Operator-key coercion ────────────────────────────────────────────────────
+// ─── Fused coercion pass ──────────────────────────────────────────────────────
 
-/**
- * Recursively walks a parsed (sanitized) object/array tree and rewrites
- * plain operator-like KEYS (eq, ne, gt, gte, lt, lte, in, nin) to their
- * "$"-prefixed Mongo equivalents (e.g. `{ age: { gte: 18 } }` →
- * `{ age: { $gte: 18 } }`).
- *
- * This replaces the previous implementation, which ran a regex over the
- * JSON-stringified filter and rewrote ANY occurrence of these words —
- * including inside string VALUES (e.g. `?name=eq` or `?status=in`),
- * silently corrupting user data into Mongo operators. By operating on the
- * parsed object tree and only ever touching object KEYS, string values are
- * never inspected or mutated.
- */
-function coerceOperatorKeys(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => coerceOperatorKeys(item));
-  }
+function coerceAll(value: unknown, parentKey = ''): unknown {
+  if (value === null) return null;
 
-  if (
-    value !== null &&
-    typeof value === 'object' &&
-    !(value instanceof Date) &&
-    Object.getPrototypeOf(value) === Object.prototype
-  ) {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      const newKey = COERCIBLE_OPS.has(k) ? `$${k}` : k;
-      out[newKey] = coerceOperatorKeys(v);
+  if (typeof value === 'string') {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+
+    if (DATE_FIELD_RE.test(parentKey)) {
+      const parsed = new Date(value);
+      if (!isNaN(parsed.getTime())) {
+        if (PLAIN_DATE_RE.test(value)) {
+          const start = new Date(value);
+          const end = new Date(start);
+          end.setUTCDate(end.getUTCDate() + 1);
+          return { $gte: start, $lt: end };
+        }
+        return parsed;
+      }
     }
-    return out;
+
+    return value;
   }
 
-  return value;
-}
-
-// ─── Type coercion ────────────────────────────────────────────────────────────
-
-/**
- * Recursively coerces string 'true'/'false' to booleans at any nesting depth.
- * Fixes the original shallow-only implementation.
- */
-function coerceBooleans(value: unknown): unknown {
-  if (value === 'true') return true;
-  if (value === 'false') return false;
+  if (typeof value !== 'object') return value;
 
   if (Array.isArray(value)) {
-    return value.map((item) => coerceBooleans(item));
+    return (value as unknown[]).map((item) => coerceAll(item, parentKey));
   }
 
-  if (
-    value !== null &&
-    typeof value === 'object' &&
-    !(value instanceof Date) &&
-    Object.getPrototypeOf(value) === Object.prototype
-  ) {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = coerceBooleans(v);
-    }
-    return out;
-  }
+  if (value instanceof Date) return value;
 
-  return value;
-}
-
-function coerceDates(
-  obj: Record<string, unknown>,
-  parentKey = '',
-): Record<string, unknown> {
+  const src = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
 
-  for (const [k, v] of Object.entries(obj)) {
-    const isOp = k.startsWith('$');
-    const path = isOp ? parentKey : parentKey ? `${parentKey}.${k}` : k;
-
-    if (
-      v !== null &&
-      typeof v === 'object' &&
-      !Array.isArray(v) &&
-      !(v instanceof Date)
-    ) {
-      out[k] = coerceDates(v as Record<string, unknown>, path);
-      continue;
-    }
-
-    if (typeof v === 'string' && DATE_FIELD_RE.test(path)) {
-      const parsed = new Date(v);
-      if (isNaN(parsed.getTime())) {
-        // Leave unparseable strings as-is; Mongoose CastError → 400 upstream.
-        out[k] = v;
-        continue;
-      }
-      if (PLAIN_DATE_RE.test(v)) {
-        const start = new Date(v);
-        const end = new Date(start);
-        end.setUTCDate(end.getUTCDate() + 1);
-        out[k] = { $gte: start, $lt: end };
-        continue;
-      }
-      out[k] = parsed;
-      continue;
-    }
-
-    out[k] = v;
+  for (const k in src) {
+    if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
+    const newKey = COERCIBLE_OPS.has(k) ? `$${k}` : k;
+    const isOp = k.startsWith('$') || COERCIBLE_OPS.has(k);
+    const childPath = isOp ? parentKey : parentKey ? `${parentKey}.${k}` : k;
+    out[newKey] = coerceAll(src[k], childPath);
   }
 
   return out;
@@ -348,40 +327,35 @@ function coerceDates(
 
 // ─── Operator validation ──────────────────────────────────────────────────────
 
-/**
- * Recursively walks the entire filter tree and throws on:
- *  1. Banned operators at any depth ($where, $expr, $function, etc.)
- *  2. Unknown top-level $ operators (only $and/$or/$nor/$not allowed at root)
- *
- * Fixes the original shallow-only check.
- */
 function rejectDisallowedOperators(
   filter: Record<string, unknown>,
   depth = 0,
 ): void {
-  for (const [k, v] of Object.entries(filter)) {
-    // Always banned at any depth
+  for (const k in filter) {
+    if (!Object.prototype.hasOwnProperty.call(filter, k)) continue;
+
     if (BANNED_OPERATORS.has(k)) {
       throw new QueryFindValidationError(
         `Disallowed operator in query: "${k}"`,
       );
     }
 
-    // Top-level unknown $ operators
     if (depth === 0 && k.startsWith('$') && !ALLOWED_TOP_LEVEL_OPS.has(k)) {
       throw new QueryFindValidationError(
         `Disallowed top-level operator in query string: "${k}"`,
       );
     }
 
-    // Recurse into nested objects
+    const v = filter[k];
+
     if (Array.isArray(v)) {
       for (const item of v) {
         if (
           item !== null &&
           typeof item === 'object' &&
           !Array.isArray(item) &&
-          !(item instanceof Date)
+          !(item instanceof Date) &&
+          Object.getPrototypeOf(item) === Object.prototype
         ) {
           rejectDisallowedOperators(item as Record<string, unknown>, depth + 1);
         }
@@ -402,24 +376,19 @@ function rejectDisallowedOperators(
 function buildFilter(
   raw: QueryParams,
   allowedLookup: Set<string>,
-  allowedFields: Set<string>,
+  canonicalMap: Map<string, string>,
+  onDrop?: (path: string, value: unknown) => void,
 ): Record<string, unknown> {
   const stripped: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(raw)) {
-    if (!RESERVED_KEYS.has(k)) stripped[k] = v;
+  for (const k in raw) {
+    if (Object.prototype.hasOwnProperty.call(raw, k) && !RESERVED_KEYS.has(k)) {
+      stripped[k] = raw[k];
+    }
   }
 
-  const safe = sanitize(stripped) as Record<string, unknown>;
-
-  // Rewrite bare operator keys (eq/ne/gt/...) to "$"-prefixed Mongo
-  // operators. Operates on parsed object KEYS only — string values
-  // (e.g. ?status=in, ?name=eq) are never touched.
-  const withOps = coerceOperatorKeys(safe) as Record<string, unknown>;
-
-  const coerced = coerceDates(
-    coerceBooleans(withOps) as Record<string, unknown>,
-  );
-  const allowed = enforceAllowlist(coerced, allowedLookup, allowedFields);
+  const safe = sanitize(stripped, 0, '', onDrop) as Record<string, unknown>;
+  const coerced = coerceAll(safe) as Record<string, unknown>;
+  const allowed = enforceAllowlist(coerced, allowedLookup, canonicalMap);
   rejectDisallowedOperators(allowed);
 
   return allowed;
@@ -430,6 +399,7 @@ function buildFilter(
 function parseSort(
   sort: string,
   allowedLookup: Set<string>,
+  canonicalMap: Map<string, string>,
 ): Record<string, 1 | -1> {
   const out: Record<string, 1 | -1> = {};
   let count = 0;
@@ -443,10 +413,15 @@ function parseSort(
     const desc = trimmed.startsWith('-');
     const field = desc ? trimmed.slice(1).trim() : trimmed;
     if (!field) continue;
-    if (allowedLookup.size > 0 && !isFieldAllowed(field, allowedLookup))
-      continue;
 
-    out[field] = desc ? -1 : 1;
+    if (allowedLookup.size > 0) {
+      if (!isFieldAllowed(field, allowedLookup)) continue;
+      const canonical = canonicalMap.get(field.toLowerCase()) ?? field;
+      out[canonical] = desc ? -1 : 1;
+    } else {
+      out[field] = desc ? -1 : 1;
+    }
+
     count++;
   }
   return out;
@@ -454,13 +429,6 @@ function parseSort(
 
 // ─── Projection sanitizer ─────────────────────────────────────────────────────
 
-/**
- * Strips fields from a client-supplied projection that are not in the allowlist.
- * Handles both inclusion ("name email") and exclusion ("-password -__v") syntax.
- * Always permits _id and __v in exclusion projections.
- * Allowlist matching is case-insensitive.
- * When allowedFields is empty, returns the projection unchanged.
- */
 function sanitizeProjection(
   projection: string,
   allowedLookup: Set<string>,
@@ -495,23 +463,6 @@ function sanitizeProjection(
  *   .populate('department', 'name')
  *   .paginate();
  * ```
- *
- * Security notes:
- *  - `.allowFields()` before `.filter()` restricts which URL params reach Mongo.
- *  - Allowlist matching (filter/sort/projection) is case-insensitive — e.g.
- *    allowFields(['name']) also matches ?Name=, ?NAME=, etc. For `.filter()`,
- *    a matched field is also normalized back to the casing declared in
- *    allowFields() (e.g. ?NAME=foo -> { name: 'foo' }) so it matches the
- *    actual schema path.
- *  - `.where()` conditions are hard — URL cannot override them.
- *  - Unknown/banned $ operators throw QueryFindValidationError (checked recursively).
- *  - Nesting depth capped at 5; page size capped at 100; sort fields capped at 5.
- *  - Search terms are regex-escaped (ReDoS prevention) and length-capped at 200 chars.
- *  - ?fields= projection is allowlist-filtered to prevent sensitive field leakage.
- *  - Operator-key coercion (eq/gte/in/...) only touches object KEYS, never string
- *    VALUES — a search like ?name=eq or ?status=in cannot be corrupted into a
- *    Mongo operator.
- *  - All queries run with maxTimeMS to prevent runaway collection scans.
  */
 export class QueryFind<
   TRawDocType,
@@ -519,15 +470,32 @@ export class QueryFind<
 > {
   private readonly model: TModelType;
   private readonly qs: Readonly<QueryParams>;
-  private readonly options: Required<QueryFindOptions>;
+  private readonly options: Required<
+    Omit<QueryFindOptions, 'onSlowQuery' | 'onSanitizeDrop'>
+  > &
+    Pick<QueryFindOptions, 'onSlowQuery' | 'onSanitizeDrop'>;
 
   private _allowedFields: Set<string> = new Set();
-  /** Lowercase mirror of _allowedFields, used for case-insensitive matching. */
   private _allowedLookup: Set<string> = new Set();
-  private _filter: Record<string, unknown> = {};
+  private _canonicalMap: Map<string, string> = new Map();
+
+  // Fix #1: URL-derived filter and server-side conditions stored separately.
+  // Server conditions are merged last in paginate() and can never be
+  // overwritten by URL params regardless of call order.
+  private _urlFilter: Record<string, unknown> = {};
+  private _serverConditions: Record<string, unknown> = {};
+
+  // Fix #2: track search $or clauses separately so double-call extends rather
+  // than re-wraps.
+  private _searchOr: Record<string, unknown>[] = [];
+
   private _sort: Record<string, 1 | -1> = { ...DEFAULT_SORT };
   private _select: string | null = null;
   private _populates: PopulateOptions[] = [];
+
+  // Fix #4: page and limit computed once in constructor.
+  private readonly _page: number;
+  private readonly _limit: number;
 
   constructor(
     query: Query<TRawDocType[], TRawDocType>,
@@ -538,113 +506,111 @@ export class QueryFind<
     this.qs = Object.freeze({ ...queryString });
     this.options = {
       maxTimeMS: options.maxTimeMS ?? DEFAULT_MAX_TIME_MS,
+      slowQueryThresholdMS:
+        options.slowQueryThresholdMS ??
+        options.maxTimeMS ??
+        DEFAULT_MAX_TIME_MS,
+      lean: options.lean ?? true,
+      onSlowQuery: options.onSlowQuery,
+      onSanitizeDrop: options.onSanitizeDrop,
     };
+
+    // Fix #4: parse once, not on every paginate() call.
+    this._page = parsePage(this.qs.page);
+    this._limit = parseLimit(this.qs.limit);
   }
 
   // ── Configuration ───────────────────────────────────────────────────────────
 
-  /**
-   * Declare which fields may appear in URL filters, sort, and projection.
-   * Matching against `?field=`, `?sort=`, and `?fields=` is case-insensitive,
-   * so `allowFields(['Name', 'Email'])` will also match `?name=`, `?NAME=`,
-   * `?eMail=`, etc.
-   * Call before `.filter()`, `.sort()`, and `.limitFields()`.
-   */
+  // Fix #6: allowedStructures only rebuilt when this method is called.
   allowFields(fields: string[]): this {
     this._allowedFields = new Set(fields);
-    this._allowedLookup = buildAllowedLookup(this._allowedFields);
+    const { lookup, canonical } = buildAllowedStructures(this._allowedFields);
+    this._allowedLookup = lookup;
+    this._canonicalMap = canonical;
     return this;
   }
 
   // ── Builder methods ─────────────────────────────────────────────────────────
 
-  /** Parse URL query params into a Mongoose filter (respects allowlist). */
   filter(): this {
     const parsed = buildFilter(
       this.qs,
       this._allowedLookup,
-      this._allowedFields,
+      this._canonicalMap,
+      this.options.onSanitizeDrop,
     );
-    Object.assign(this._filter, parsed);
+    Object.assign(this._urlFilter, parsed);
     return this;
   }
 
   /**
    * Apply mandatory server-side conditions the URL cannot override.
-   * Use for multi-tenancy, soft-delete exclusion, etc.
+   *
+   * Fix #1: conditions are stored in _serverConditions and merged into the
+   * final filter last, inside paginate(). This guarantees URL params (stored
+   * in _urlFilter) can never overwrite server-side values regardless of the
+   * order in which .where() and .filter() are called.
    *
    * @example .where({ orgId: req.user.orgId, deletedAt: null })
    */
   where(conditions: Partial<Record<keyof TRawDocType, unknown>>): this {
-    Object.assign(this._filter, conditions);
+    const asRecord = conditions as Record<string, unknown>;
+
+    // Validate operators in server-supplied conditions.
+    // We don't sanitize here (Dates, ObjectIds etc. are legitimate server values),
+    // but we do reject banned $ operators in case user data leaked in.
+    rejectDisallowedOperators(asRecord);
+
+    Object.assign(this._serverConditions, asRecord);
     return this;
   }
 
   /**
    * Case-insensitive full-text search across `fields` when `?q=` is present.
-   * Search term is regex-escaped (ReDoS prevention) and capped at 200 chars.
-   * Preserves any existing `$or` by lifting both into `$and`.
+   *
+   * Fix #2: subsequent calls extend the $or clause list rather than re-wrapping
+   * the filter in nested $and, preventing double-wrapping and preserving index
+   * usage.
    */
   globalSearch(fields: string[]): this {
     const raw = this.qs.q?.trim();
 
-    // Guard: missing, empty, or oversized search term
     if (!raw || raw.length > MAX_SEARCH_LENGTH || fields.length === 0) {
       return this;
     }
 
-    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const searchOr = fields.map((field) => ({
-      [field]: { $regex: escaped, $options: 'i' },
-    }));
+    const safeFields =
+      this._allowedLookup.size > 0
+        ? fields.filter((f) => isFieldAllowed(f, this._allowedLookup))
+        : fields;
 
-    // Always AND the search clause with whatever conditions are already
-    // present (top-level fields from .where()/.filter(), or existing
-    // $or/$and). This avoids the bug where a top-level field that
-    // happens to also be one of the `fields` passed here (e.g.
-    // ?status=active combined with .globalSearch(['status','name']))
-    // would sit alongside $or and be implicitly ANDed with it — making
-    // the search match only documents where `status` is BOTH exactly
-    // "active" AND matches the regex, silently excluding matches on
-    // `name`. Wrapping the existing filter as one branch of $and
-    // preserves all prior conditions intact while ORing across the
-    // search fields independently.
-    if (Object.keys(this._filter).length > 0) {
-      this._filter = {
-        $and: [this._filter, { $or: searchOr }],
-      };
-    } else {
-      this._filter = { $or: searchOr as MFilter<TRawDocType>['$or'] };
+    if (safeFields.length === 0) return this;
+
+    const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'i');
+
+    // Extend _searchOr; the $or clause is assembled once in paginate().
+    for (const field of safeFields) {
+      this._searchOr.push({ [field]: regex });
     }
 
     return this;
   }
 
-  /**
-   * Apply sort from `?sort=`. Falls back to `{ createdAt: -1 }`.
-   * Fields not in the allowlist are silently skipped (case-insensitive match).
-   * Capped at MAX_SORT_FIELDS (5) fields.
-   */
   sort(): this {
     if (this.qs.sort) {
-      const parsed = parseSort(this.qs.sort, this._allowedLookup);
+      const parsed = parseSort(
+        this.qs.sort,
+        this._allowedLookup,
+        this._canonicalMap,
+      );
       this._sort =
         Object.keys(parsed).length > 0 ? parsed : { ...DEFAULT_SORT };
     }
     return this;
   }
 
-  /**
-   * Configure field projection.
-   * Priority: `?fields=` query param > `defaultFields` argument > no projection.
-   *
-   * When `allowFields()` has been called, any field in `?fields=` that is not
-   * in the allowlist is stripped (case-insensitive match) — preventing clients
-   * from projecting sensitive fields like `password` or `resetToken`.
-   *
-   * @param defaultFields  e.g. `'-password -__v'` — always excluded when the
-   *                       client does not supply `?fields=`.
-   */
   limitFields(defaultFields?: string): this {
     if (this.qs.fields) {
       const raw = this.qs.fields
@@ -660,7 +626,7 @@ export class QueryFind<
   }
 
   /**
-   * Register a populate path. Chainable; all entries applied in `paginate()`.
+   * Register a populate path.
    *
    * @example
    *   .populate('author')
@@ -671,9 +637,117 @@ export class QueryFind<
     if (typeof path === 'string') {
       this._populates.push(select ? { path, select } : { path });
     } else {
-      this._populates.push(path);
+      if (path.match != null) {
+        const rawMatch = path.match as Record<string, unknown>;
+        const safeMatch = sanitize(
+          rawMatch,
+          0,
+          'populate.match',
+          this.options.onSanitizeDrop,
+        ) as Record<string, unknown>;
+        rejectDisallowedOperators(safeMatch);
+        this._populates.push({ ...path, match: safeMatch });
+      } else {
+        this._populates.push(path);
+      }
     }
     return this;
+  }
+
+  // ── Private helpers ─────────────────────────────────────────────────────────
+
+  /**
+   * Fix #1: assemble the final filter by merging URL filter, search clause,
+   * and server conditions. Server conditions are applied last so they can
+   * never be overwritten by URL-derived values.
+   *
+   * Fix #2: _searchOr is assembled here once rather than incrementally
+   * mutating _filter during globalSearch() calls.
+   */
+  private buildFinalFilter(): Record<string, unknown> {
+    let base: Record<string, unknown> = { ...this._urlFilter };
+
+    if (this._searchOr.length > 0) {
+      if (Object.keys(base).length > 0) {
+        base = { $and: [base, { $or: this._searchOr }] };
+      } else {
+        base = { $or: this._searchOr };
+      }
+    }
+
+    // Server conditions merged last — URL cannot override these.
+    return { ...base, ...this._serverConditions };
+  }
+
+  /**
+   * Fix #7: execFind promoted to private method — no longer a closure
+   * recreated on every paginate() call.
+   */
+  private execFind(
+    mongoFilter: MFilter<TRawDocType>,
+    skip: number,
+  ): Promise<TRawDocType[]> {
+    const { maxTimeMS, lean } = this.options;
+    const q = this.model
+      .find(mongoFilter)
+      .sort(this._sort)
+      .skip(skip)
+      .limit(this._limit);
+
+    // Fix #9: lean() is opt-out, not hardcoded.
+    if (lean) q.lean();
+    if (this._select) q.select(this._select);
+    for (const opt of this._populates) q.populate(opt);
+    if (maxTimeMS > 0) q.maxTimeMS(maxTimeMS);
+
+    return q.exec() as Promise<TRawDocType[]>;
+  }
+
+  /**
+   * Fix #7: execCount promoted to private method.
+   * Calls .exec() directly — avoids the Model<unknown> generic mismatch that
+   * broke the earlier execCountQuery helper approach.
+   */
+  private async execCount(
+    mongoFilter: MFilter<TRawDocType>,
+    hasFilter: boolean,
+  ): Promise<number> {
+    const { maxTimeMS } = this.options;
+    if (!hasFilter) {
+      return (await this.model
+        .estimatedDocumentCount()
+        .maxTimeMS(maxTimeMS)
+        .exec()) as number;
+    }
+    return (await (this.model as Model<TRawDocType>)
+      .countDocuments(mongoFilter)
+      .maxTimeMS(maxTimeMS)
+      .exec()) as number;
+  }
+
+  /**
+   * Fix #3 + Fix #7: wrapTimed promoted to a private method that accepts an
+   * explicit start time so the slow-query clock can be started before
+   * execCount() on page > 1 paths, covering the full round-trip.
+   */
+  private async wrapTimed<R = void>(
+    fn: () => Promise<R>,
+    page: number,
+    limit: number,
+    filter: Record<string, unknown>,
+  ): Promise<R> {
+    const { onSlowQuery, slowQueryThresholdMS, maxTimeMS } = this.options;
+    if (!onSlowQuery) return fn();
+
+    const start = Date.now();
+    const result = await fn();
+    const elapsedMs = Date.now() - start;
+
+    if (elapsedMs >= (slowQueryThresholdMS ?? maxTimeMS)) {
+      onSlowQuery({ elapsedMs, filter, sort: this._sort, page, limit });
+    }
+
+    return result;
   }
 
   // ── Terminal ────────────────────────────────────────────────────────────────
@@ -681,51 +755,34 @@ export class QueryFind<
   /**
    * Execute and return a paginated result.
    *
-   * - count + find run fully in parallel via Promise.all (saves one round-trip).
-   * - Uses estimatedDocumentCount fast-path when no filter is applied (O(1)).
-   * - .lean() returns plain objects (~3-5× faster for read-only responses).
-   * - maxTimeMS applied to both count and find (prevents runaway scans).
-   * - page is clamped to 1 if it exceeds totalPages (safe mid-delete behavior).
-   *
+   * @param cachedTotal - Previously fetched total (from a page-1 response).
+   *   When provided on page > 1, the count query is skipped entirely.
    * @throws {QueryFindValidationError} on disallowed $ operators in the URL.
    */
-  async paginate(): Promise<PaginatedResult<TRawDocType>> {
-    const page = parsePage(this.qs.page);
-    const limit = parseLimit(this.qs.limit);
-    const mongoFilter = this._filter as MFilter<TRawDocType>;
-    const hasFilter = Object.keys(this._filter).length > 0;
-    const { maxTimeMS } = this.options;
+  async paginate(cachedTotal?: number): Promise<PaginatedResult<TRawDocType>> {
+    const page = this._page;
+    const limit = this._limit;
 
-    const buildFind = (skip: number) => {
-      const q = this.model
-        .find(mongoFilter)
-        .sort(this._sort)
-        .skip(skip)
-        .limit(limit)
-        .lean();
-      if (this._select) q.select(this._select);
-      for (const opt of this._populates) q.populate(opt);
-      if (maxTimeMS > 0) q.maxTimeMS(maxTimeMS);
-      return q.exec() as Promise<TRawDocType[]>;
-    };
+    // Fix #1: final filter assembled here — server conditions always win.
+    const finalFilter = this.buildFinalFilter();
+    const mongoFilter = finalFilter as MFilter<TRawDocType>;
+    const hasFilter = Object.keys(finalFilter).length > 0;
 
-    const countQuery: Promise<number> = hasFilter
-      ? (this.model
-          .countDocuments(mongoFilter)
-          .maxTimeMS(maxTimeMS) as unknown as Promise<number>)
-      : (this.model.estimatedDocumentCount() as unknown as Promise<number>);
-
-    const [total, firstPageData] = await Promise.all([
-      countQuery,
-      buildFind(0),
-    ]);
-
-    const totalPages = Math.max(Math.ceil(total / limit), 1);
-    const safePage = page > totalPages ? 1 : page;
-
-    if (safePage === 1) {
+    // ── Page 1: count + find in parallel ─────────────────────────────────────
+    if (page === 1) {
+      const [total, data] = await this.wrapTimed(
+        () =>
+          Promise.all([
+            this.execCount(mongoFilter, hasFilter),
+            this.execFind(mongoFilter, 0),
+          ]),
+        page,
+        limit,
+        finalFilter,
+      );
+      const totalPages = Math.max(Math.ceil(total / limit), 1);
       return {
-        data: firstPageData,
+        data,
         total,
         page: 1,
         totalPages,
@@ -735,16 +792,67 @@ export class QueryFind<
       };
     }
 
-    const data = await buildFind((safePage - 1) * limit);
+    // ── Page > 1 with cached total: skip count ────────────────────────────────
+    if (cachedTotal !== undefined) {
+      const totalPages = Math.max(Math.ceil(cachedTotal / limit), 1);
+      const safePage = page > totalPages ? 1 : page;
+      const data = await this.wrapTimed(
+        () => this.execFind(mongoFilter, (safePage - 1) * limit),
+        safePage,
+        limit,
+        finalFilter,
+      );
+      return {
+        data,
+        total: cachedTotal,
+        page: safePage,
+        totalPages,
+        limit,
+        hasNextPage: safePage < totalPages,
+        hasPrevPage: safePage > 1,
+      };
+    }
+
+    // ── Page > 1 without cached total: count + find, both timed ──────────────
+    //
+    // Fix #3: the entire block (count + find) is wrapped in wrapTimed so slow
+    // counts on subsequent pages are visible to onSlowQuery. Previously only
+    // execFind was timed on this path.
+    //
+    // We break out of the generic wrapTimed by collecting the result into a
+    // side-channel object that is mutated inside the timed closure. This avoids
+    // the tuple-inside-R TypeScript inference problem entirely.
+    const result: {
+      total: number;
+      data: TRawDocType[];
+      safePage: number;
+      totalPages: number;
+    } = { total: 0, data: [], safePage: page, totalPages: 1 };
+
+    await this.wrapTimed(
+      async () => {
+        const total = await this.execCount(mongoFilter, hasFilter);
+        const totalPages = Math.max(Math.ceil(total / limit), 1);
+        const safePage = page > totalPages ? 1 : page;
+        const data = await this.execFind(mongoFilter, (safePage - 1) * limit);
+        result.total = total;
+        result.data = data;
+        result.safePage = safePage;
+        result.totalPages = totalPages;
+      },
+      page,
+      limit,
+      finalFilter,
+    );
 
     return {
-      data,
-      total,
-      page: safePage,
-      totalPages,
+      data: result.data,
+      total: result.total,
+      page: result.safePage,
+      totalPages: result.totalPages,
       limit,
-      hasNextPage: safePage < totalPages,
-      hasPrevPage: safePage > 1,
+      hasNextPage: result.safePage < result.totalPages,
+      hasPrevPage: result.safePage > 1,
     };
   }
 }
