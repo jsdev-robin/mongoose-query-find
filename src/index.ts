@@ -10,6 +10,7 @@
  *  - count + find run fully in parallel (Promise.all)
  *  - Hard limits on page size, sort fields, search length, nesting depth (DoS protection)
  *  - Allowlist-based field filtering on filters, sort, AND projection (NoSQL injection prevention)
+ *  - Case-insensitive allowlist matching (e.g. allowFields(['Name']) matches ?name=, ?NAME=, ?Name=)
  *  - Deep recursive operator validation (catches nested $where, $expr, etc.)
  *  - Deep recursive boolean coercion (handles nested query objects)
  *  - Deep recursive operator-key coercion (eq/ne/gt/... → $eq/$ne/$gt/...), applied
@@ -187,14 +188,31 @@ function sanitize(value: unknown, depth = 0): unknown {
 
 // ─── Allowlist ────────────────────────────────────────────────────────────────
 
+/**
+ * Builds a lowercase lookup set from the user-supplied allowlist so that
+ * field matching is case-insensitive (e.g. allowFields(['Name', 'Email'])
+ * will match ?name=, ?NAME=, ?eMail=, etc.). The original-cased fields are
+ * still used wherever they need to be emitted (e.g. default sort/projection).
+ */
+function buildAllowedLookup(allowedFields: Set<string>): Set<string> {
+  const lookup = new Set<string>();
+  for (const f of allowedFields) lookup.add(f.toLowerCase());
+  return lookup;
+}
+
+/** Case-insensitive membership check against a lowercase lookup set. */
+function isFieldAllowed(field: string, allowedLookup: Set<string>): boolean {
+  return allowedLookup.has(field.toLowerCase());
+}
+
 function enforceAllowlist(
   filter: Record<string, unknown>,
-  allowedFields: Set<string>,
+  allowedLookup: Set<string>,
 ): Record<string, unknown> {
-  if (allowedFields.size === 0) return filter;
+  if (allowedLookup.size === 0) return filter;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(filter)) {
-    if (k.startsWith('$') || allowedFields.has(k)) out[k] = v;
+    if (k.startsWith('$') || isFieldAllowed(k, allowedLookup)) out[k] = v;
   }
   return out;
 }
@@ -365,7 +383,7 @@ function rejectDisallowedOperators(
 
 function buildFilter(
   raw: QueryParams,
-  allowedFields: Set<string>,
+  allowedLookup: Set<string>,
 ): Record<string, unknown> {
   const stripped: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -382,7 +400,7 @@ function buildFilter(
   const coerced = coerceDates(
     coerceBooleans(withOps) as Record<string, unknown>,
   );
-  const allowed = enforceAllowlist(coerced, allowedFields);
+  const allowed = enforceAllowlist(coerced, allowedLookup);
   rejectDisallowedOperators(allowed);
 
   return allowed;
@@ -392,7 +410,7 @@ function buildFilter(
 
 function parseSort(
   sort: string,
-  allowedFields: Set<string>,
+  allowedLookup: Set<string>,
 ): Record<string, 1 | -1> {
   const out: Record<string, 1 | -1> = {};
   let count = 0;
@@ -406,7 +424,8 @@ function parseSort(
     const desc = trimmed.startsWith('-');
     const field = desc ? trimmed.slice(1).trim() : trimmed;
     if (!field) continue;
-    if (allowedFields.size > 0 && !allowedFields.has(field)) continue;
+    if (allowedLookup.size > 0 && !isFieldAllowed(field, allowedLookup))
+      continue;
 
     out[field] = desc ? -1 : 1;
     count++;
@@ -420,13 +439,14 @@ function parseSort(
  * Strips fields from a client-supplied projection that are not in the allowlist.
  * Handles both inclusion ("name email") and exclusion ("-password -__v") syntax.
  * Always permits _id and __v in exclusion projections.
+ * Allowlist matching is case-insensitive.
  * When allowedFields is empty, returns the projection unchanged.
  */
 function sanitizeProjection(
   projection: string,
-  allowedFields: Set<string>,
+  allowedLookup: Set<string>,
 ): string {
-  if (allowedFields.size === 0) return projection;
+  if (allowedLookup.size === 0) return projection;
 
   return projection
     .split(/\s+/)
@@ -434,7 +454,7 @@ function sanitizeProjection(
       if (!token) return false;
       const field = token.startsWith('-') ? token.slice(1) : token;
       if (field === '__v' || field === '_id') return true;
-      return allowedFields.has(field);
+      return isFieldAllowed(field, allowedLookup);
     })
     .join(' ');
 }
@@ -459,6 +479,8 @@ function sanitizeProjection(
  *
  * Security notes:
  *  - `.allowFields()` before `.filter()` restricts which URL params reach Mongo.
+ *  - Allowlist matching (filter/sort/projection) is case-insensitive — e.g.
+ *    allowFields(['name']) also matches ?Name=, ?NAME=, etc.
  *  - `.where()` conditions are hard — URL cannot override them.
  *  - Unknown/banned $ operators throw QueryFindValidationError (checked recursively).
  *  - Nesting depth capped at 5; page size capped at 100; sort fields capped at 5.
@@ -478,6 +500,8 @@ export class QueryFind<
   private readonly options: Required<QueryFindOptions>;
 
   private _allowedFields: Set<string> = new Set();
+  /** Lowercase mirror of _allowedFields, used for case-insensitive matching. */
+  private _allowedLookup: Set<string> = new Set();
   private _filter: Record<string, unknown> = {};
   private _sort: Record<string, 1 | -1> = { ...DEFAULT_SORT };
   private _select: string | null = null;
@@ -499,10 +523,14 @@ export class QueryFind<
 
   /**
    * Declare which fields may appear in URL filters, sort, and projection.
+   * Matching against `?field=`, `?sort=`, and `?fields=` is case-insensitive,
+   * so `allowFields(['Name', 'Email'])` will also match `?name=`, `?NAME=`,
+   * `?eMail=`, etc.
    * Call before `.filter()`, `.sort()`, and `.limitFields()`.
    */
   allowFields(fields: string[]): this {
     this._allowedFields = new Set(fields);
+    this._allowedLookup = buildAllowedLookup(this._allowedFields);
     return this;
   }
 
@@ -510,7 +538,7 @@ export class QueryFind<
 
   /** Parse URL query params into a Mongoose filter (respects allowlist). */
   filter(): this {
-    const parsed = buildFilter(this.qs, this._allowedFields);
+    const parsed = buildFilter(this.qs, this._allowedLookup);
     Object.assign(this._filter, parsed);
     return this;
   }
@@ -568,12 +596,12 @@ export class QueryFind<
 
   /**
    * Apply sort from `?sort=`. Falls back to `{ createdAt: -1 }`.
-   * Fields not in the allowlist are silently skipped.
+   * Fields not in the allowlist are silently skipped (case-insensitive match).
    * Capped at MAX_SORT_FIELDS (5) fields.
    */
   sort(): this {
     if (this.qs.sort) {
-      const parsed = parseSort(this.qs.sort, this._allowedFields);
+      const parsed = parseSort(this.qs.sort, this._allowedLookup);
       this._sort =
         Object.keys(parsed).length > 0 ? parsed : { ...DEFAULT_SORT };
     }
@@ -585,8 +613,8 @@ export class QueryFind<
    * Priority: `?fields=` query param > `defaultFields` argument > no projection.
    *
    * When `allowFields()` has been called, any field in `?fields=` that is not
-   * in the allowlist is stripped — preventing clients from projecting sensitive
-   * fields like `password` or `resetToken`.
+   * in the allowlist is stripped (case-insensitive match) — preventing clients
+   * from projecting sensitive fields like `password` or `resetToken`.
    *
    * @param defaultFields  e.g. `'-password -__v'` — always excluded when the
    *                       client does not supply `?fields=`.
@@ -598,7 +626,7 @@ export class QueryFind<
         .map((f) => f.trim())
         .filter(Boolean)
         .join(' ');
-      this._select = sanitizeProjection(raw, this._allowedFields);
+      this._select = sanitizeProjection(raw, this._allowedLookup);
     } else if (defaultFields) {
       this._select = defaultFields;
     }
