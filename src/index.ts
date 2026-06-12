@@ -205,14 +205,32 @@ function isFieldAllowed(field: string, allowedLookup: Set<string>): boolean {
   return allowedLookup.has(field.toLowerCase());
 }
 
+/**
+ * Allowlist-filters the top-level keys of a client-supplied filter object.
+ * `$`-prefixed operator keys (e.g. $and, $or) always pass through.
+ * Matching is case-insensitive (via allowedLookup), and a matched key is
+ * rewritten to the casing originally declared in allowFields() — e.g.
+ * ?NAME=foo with allowFields(['name']) becomes { name: 'foo' }, not
+ * { NAME: 'foo' }, so it actually matches the schema path.
+ */
 function enforceAllowlist(
   filter: Record<string, unknown>,
   allowedLookup: Set<string>,
+  allowedFields: Set<string>,
 ): Record<string, unknown> {
   if (allowedLookup.size === 0) return filter;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(filter)) {
-    if (k.startsWith('$') || isFieldAllowed(k, allowedLookup)) out[k] = v;
+    if (k.startsWith('$')) {
+      out[k] = v;
+      continue;
+    }
+    if (isFieldAllowed(k, allowedLookup)) {
+      const canonical =
+        [...allowedFields].find((f) => f.toLowerCase() === k.toLowerCase()) ??
+        k;
+      out[canonical] = v;
+    }
   }
   return out;
 }
@@ -384,6 +402,7 @@ function rejectDisallowedOperators(
 function buildFilter(
   raw: QueryParams,
   allowedLookup: Set<string>,
+  allowedFields: Set<string>,
 ): Record<string, unknown> {
   const stripped: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -400,7 +419,7 @@ function buildFilter(
   const coerced = coerceDates(
     coerceBooleans(withOps) as Record<string, unknown>,
   );
-  const allowed = enforceAllowlist(coerced, allowedLookup);
+  const allowed = enforceAllowlist(coerced, allowedLookup, allowedFields);
   rejectDisallowedOperators(allowed);
 
   return allowed;
@@ -480,7 +499,10 @@ function sanitizeProjection(
  * Security notes:
  *  - `.allowFields()` before `.filter()` restricts which URL params reach Mongo.
  *  - Allowlist matching (filter/sort/projection) is case-insensitive — e.g.
- *    allowFields(['name']) also matches ?Name=, ?NAME=, etc.
+ *    allowFields(['name']) also matches ?Name=, ?NAME=, etc. For `.filter()`,
+ *    a matched field is also normalized back to the casing declared in
+ *    allowFields() (e.g. ?NAME=foo -> { name: 'foo' }) so it matches the
+ *    actual schema path.
  *  - `.where()` conditions are hard — URL cannot override them.
  *  - Unknown/banned $ operators throw QueryFindValidationError (checked recursively).
  *  - Nesting depth capped at 5; page size capped at 100; sort fields capped at 5.
@@ -538,7 +560,11 @@ export class QueryFind<
 
   /** Parse URL query params into a Mongoose filter (respects allowlist). */
   filter(): this {
-    const parsed = buildFilter(this.qs, this._allowedLookup);
+    const parsed = buildFilter(
+      this.qs,
+      this._allowedLookup,
+      this._allowedFields,
+    );
     Object.assign(this._filter, parsed);
     return this;
   }
