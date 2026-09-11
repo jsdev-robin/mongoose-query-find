@@ -1,11 +1,14 @@
 {
   "name": "mongoose-query-find",
-  "version": "3.0.6",
+  "version": "3.0.7",
   "private": false,
   "license": "MIT",
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -46,10 +49,16 @@
     "dynamic-query",
     "query-helper",
     "async-query",
-    "crud-utilities"
+    "crud-utilities",
+    "aggregation",
+    "aggregation-pipeline",
+    "lookup",
+    "join",
+    "timezone",
+    "date-filtering"
   ],
   "homepage": "https://github.com/jsdev-robin/mongoose-query-find#readme",
-  "description": "QueryFind is a TypeScript utility for Mongoose that simplifies building dynamic queries. It supports advanced filtering, global search across multiple fields, sorting, field selection, and pagination for MongoDB documents, making API query handling more efficient and maintainable.",
+  "description": "TypeScript query and aggregation-pipeline builder for Mongoose. Provides QueryFind for allowlisted filtering, global search, sorting, field selection, population, and pagination on Model.find(), and QueryAggregate for the same safety model on Model.aggregate() with $lookup joins, custom pipeline stages, and timezone-aware date filtering.",
   "peerDependencies": {
     "mongoose": "^8 || ^9"
   },
@@ -61,5 +70,9 @@
     "jiti": "^2.6.1",
     "typescript": "5.2.2",
     "typescript-eslint": "^8.58.0"
+  },
+  "dependencies": {
+    "date-fns": "^4.4.0",
+    "date-fns-tz": "^3.2.0"
   }
 }
