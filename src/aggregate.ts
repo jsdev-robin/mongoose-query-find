@@ -47,7 +47,7 @@
 
 import { addDays, format, startOfMonth, startOfWeek } from 'date-fns';
 import { fromZonedTime, toZonedTime } from 'date-fns-tz';
-import { Model, PipelineStage } from 'mongoose';
+import { isValidObjectId, Model, PipelineStage, Types } from 'mongoose';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -68,6 +68,15 @@ const PLAIN_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // A string that already carries its own UTC offset ("Z" or "+06:00") is
 // treated as an absolute instant rather than a local wall-clock time.
 const HAS_OFFSET_RE = /([Zz]|[+-]\d{2}:?\d{2})$/;
+
+// Matches only when the id-word is the LAST path segment (e.g. "_id",
+// "categoryId", "basicInfo.brandId") — used as a fallback heuristic when
+// .objectIdFields() isn't called explicitly. Mirrors DATE_FIELD_RE's approach.
+const OBJECTID_FIELD_RE = /(^|\.)(_id|[a-zA-Z0-9]*Id)$/;
+// A 24-char lowercase/uppercase hex string — the only shape isValidObjectId()
+// should be trusted to interpret as "meant to be an ObjectId" rather than a
+// 12-byte-length string that happens to also pass Mongoose's looser check.
+const HEX24_RE = /^[a-fA-F0-9]{24}$/;
 
 const COERCIBLE_OPS = new Set([
   'eq',
@@ -254,6 +263,17 @@ function isDateField(path: string, explicit: Set<string> | null): boolean {
   return DATE_FIELD_RE.test(path);
 }
 
+function isObjectIdField(path: string, explicit: Set<string> | null): boolean {
+  if (!path) return false;
+  const lc = path.toLowerCase();
+  if (explicit && explicit.size > 0) {
+    if (explicit.has(lc)) return true;
+    const lastSeg = lc.split('.').pop() ?? lc;
+    return explicit.has(lastSeg);
+  }
+  return OBJECTID_FIELD_RE.test(path);
+}
+
 // ─── Sanitization ─────────────────────────────────────────────────────────────
 
 /** Recursively strips non-plain values (class instances, functions) from client input. */
@@ -381,6 +401,7 @@ function coerceAll(
   value: unknown,
   timezone: string,
   dateFieldsLookup: Set<string> | null,
+  objectIdFieldsLookup: Set<string> | null,
   parentKey = '',
   parentOp?: string,
 ): unknown {
@@ -399,6 +420,20 @@ function coerceAll(
         return { $gte: start, $lt: end };
       }
       return coerceDateScalar(value, timezone) ?? value;
+    }
+
+    // ObjectId coercion — applies to bare equality values ("?categoryId=...")
+    // as well as values nested under comparison/membership operators
+    // ("?categoryId[in]=...,..."), since a plain string never matches an
+    // ObjectId-typed field in MongoDB (different BSON types). Gated on the
+    // field heuristic/explicit list AND a strict 24-char hex shape so we
+    // never misinterpret a coincidentally-24-char plain string field.
+    if (
+      isObjectIdField(parentKey, objectIdFieldsLookup) &&
+      HEX24_RE.test(value) &&
+      isValidObjectId(value)
+    ) {
+      return new Types.ObjectId(value);
     }
 
     // Numeric coercion for comparison/membership operators (eq/ne/gt/gte/lt/lte/in/nin).
@@ -425,6 +460,7 @@ function coerceAll(
         value[i],
         timezone,
         dateFieldsLookup,
+        objectIdFieldsLookup,
         parentKey,
         parentOp,
       );
@@ -444,6 +480,7 @@ function coerceAll(
       src[k],
       timezone,
       dateFieldsLookup,
+      objectIdFieldsLookup,
       childPath,
       isOp ? k : undefined,
     );
@@ -508,6 +545,7 @@ function buildFilter(
   canonicalMap: Map<string, string>,
   timezone: string,
   dateFieldsLookup: Set<string> | null,
+  objectIdFieldsLookup: Set<string> | null,
   onDrop?: (path: string, value: unknown) => void,
 ): Record<string, unknown> {
   const stripped: Record<string, unknown> = {};
@@ -518,10 +556,12 @@ function buildFilter(
   }
 
   const safe = sanitize(stripped, 0, '', onDrop) as Record<string, unknown>;
-  const coerced = coerceAll(safe, timezone, dateFieldsLookup) as Record<
-    string,
-    unknown
-  >;
+  const coerced = coerceAll(
+    safe,
+    timezone,
+    dateFieldsLookup,
+    objectIdFieldsLookup,
+  ) as Record<string, unknown>;
   const allowed = enforceAllowlist(coerced, allowedLookup, canonicalMap);
   rejectDisallowedOperators(allowed);
   return allowed;
@@ -614,6 +654,7 @@ export class QueryAggregate<T> {
   private _allowedLookup: Set<string> = new Set();
   private _canonicalMap: Map<string, string> = new Map();
   private _dateFieldsLookup: Set<string> | null = null;
+  private _objectIdFieldsLookup: Set<string> | null = null;
 
   /** URL-derived filter and server conditions are kept separate so server
    * conditions (merged last) can never be overridden by URL params. */
@@ -676,6 +717,12 @@ export class QueryAggregate<T> {
     return this;
   }
 
+  /** Explicit list of fields treated as ObjectId refs for coercion (client-supplied hex strings -> Types.ObjectId). Falls back to a name heuristic (_id/*Id) when omitted. */
+  objectIdFields(fields: string[]): this {
+    this._objectIdFieldsLookup = new Set(fields.map((f) => f.toLowerCase()));
+    return this;
+  }
+
   // ── Builder methods ───────────────────────────────────────────────────────
 
   /** Parses URL query params (req.query) into a Mongoose filter. Only allowlisted fields pass through. */
@@ -686,6 +733,7 @@ export class QueryAggregate<T> {
       this._canonicalMap,
       this.options.timezone,
       this._dateFieldsLookup,
+      this._objectIdFieldsLookup,
       this.options.onSanitizeDrop,
     );
     Object.assign(this._urlFilter, parsed);
