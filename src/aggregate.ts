@@ -400,6 +400,19 @@ function coerceAll(
       }
       return coerceDateScalar(value, timezone) ?? value;
     }
+
+    // Numeric coercion for comparison/membership operators (eq/ne/gt/gte/lt/lte/in/nin).
+    // Without this, a string like "50" under { $lte: "50" } never matches a
+    // Number field in MongoDB, since comparison operators are type-sensitive.
+    if (
+      parentOp &&
+      COERCIBLE_OPS.has(parentOp) &&
+      value.trim() !== '' &&
+      !isNaN(Number(value))
+    ) {
+      return Number(value);
+    }
+
     return value;
   }
 
