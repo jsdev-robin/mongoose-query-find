@@ -43,6 +43,23 @@
  * stages — it only blocks destructive stage types ($out/$merge). It does NOT
  * run the client-input sanitizer; that only applies to .filter()/.where(),
  * which parse untrusted req.query / req.body values.
+ *
+ * ── Custom ranges ────────────────────────────────────────────────────────────
+ * `.range(field, preset)` covers the fixed RangePreset values (today,
+ * yesterday, last7Days, last30Days, thisWeek, thisMonth). For anything more
+ * specific — a single arbitrary day, an arbitrary date span, a rolling
+ * window of N days/hours, an explicit hour-of-day window, or an explicit
+ * absolute datetime window — use the new custom range methods below:
+ *
+ *   .rangeCustomDay(field, '2026-03-14')
+ *   .rangeBetween(field, { from: '2026-01-01', to: '2026-01-31' })
+ *   .rangeLastNDays(field, 14)
+ *   .rangeLastNHours(field, 6)
+ *   .rangeHours(field, { date: '2026-03-14', fromHour: 9, toHour: 17 })
+ *   .rangeCustom(field, { from: '2026-03-14T09:00:00', to: '2026-03-15T00:00:00' })
+ *
+ * All of these behave like .range(): they set a hard, server-side condition
+ * that the client cannot override via query params.
  */
 
 import { addDays, format, startOfMonth, startOfWeek } from 'date-fns';
@@ -142,6 +159,62 @@ export type RangePreset =
   | 'last30Days'
   | 'thisWeek'
   | 'thisMonth';
+
+// ── Custom range input types (additive — used by the new rangeXxx() methods
+// below, alongside the existing RangePreset-driven .range()) ────────────────
+
+/** A single arbitrary local calendar date, e.g. "2026-03-14". */
+export type CustomDayInput = string;
+
+/** An inclusive local-date span, e.g. { from: '2026-01-01', to: '2026-01-31' }. */
+export interface CustomDateRangeInput {
+  from: string;
+  to: string;
+}
+
+/** An explicit hour-of-day window on a given local date (0–24, `toHour` exclusive; pass 24 for "through end of day"). */
+export interface CustomHourRangeInput {
+  date: string;
+  fromHour: number;
+  toHour: number;
+}
+
+/**
+ * An explicit absolute datetime window. Each of `from`/`to` accepts:
+ *   - "YYYY-MM-DD"              -> local midnight in this instance's timezone
+ *   - "YYYY-MM-DDTHH:mm:ss[.sss]" -> local wall-clock time in this instance's timezone
+ *   - an offset-bearing ISO string ("...Z" / "...+06:00") -> absolute instant
+ */
+export interface CustomDateTimeRangeInput {
+  from: string;
+  to: string;
+}
+
+// ── Advanced feature types (additive) ───────────────────────────────────────
+
+/** Options for .paginateCursor() — keyset/seek pagination, better than skip/limit on large collections. */
+export interface CursorPaginateOptions {
+  /** Opaque cursor from a previous page's `nextCursor`. Omit for the first page. */
+  cursor?: string;
+  /** Overrides the instance's parsed ?limit=, capped by maxLimit like normal pagination. */
+  limit?: number;
+}
+
+export interface CursorPaginatedResult<T> {
+  data: T[];
+  limit: number;
+  /** Pass this back as `cursor` to fetch the next page; null when there are no more results. */
+  nextCursor: string | null;
+  hasNextPage: boolean;
+}
+
+/** One aggregate metric for .stats() — e.g. { name: 'revenue', op: 'sum', field: 'total' }. */
+export interface StatSpec {
+  name: string;
+  op: 'sum' | 'avg' | 'min' | 'max' | 'count';
+  /** Required for every op except 'count'. */
+  field?: string;
+}
 
 export interface LookupOptions {
   /** Collection name (not the model name) to join against. */
@@ -755,6 +828,121 @@ export class QueryAggregate<T> {
     return this;
   }
 
+  // ── Custom range methods (additive — RangePreset/.range() above is
+  // untouched; these cover custom day / custom range / custom N-days /
+  // custom N-hours / custom hour-of-day window / custom absolute datetime
+  // window use cases) ─────────────────────────────────────────────────────
+
+  /** Hard server-side condition for a single arbitrary local calendar date (e.g. "2026-03-14"), in this instance's timezone. Not client-overridable. */
+  rangeCustomDay(field: string, date: CustomDayInput): this {
+    if (!PLAIN_DATE_RE.test(date)) {
+      throw new QueryAggregateValidationError(
+        `rangeCustomDay: "date" must be in YYYY-MM-DD format, got "${date}"`,
+      );
+    }
+    const { start, end } = this.utcRangeForLocalDates(date, date);
+    this._serverConditions[field] = { $gte: start, $lt: end };
+    return this;
+  }
+
+  /** Hard server-side condition for an arbitrary inclusive local-date span (e.g. { from: "2026-01-01", to: "2026-01-31" }), in this instance's timezone. Not client-overridable. */
+  rangeBetween(field: string, custom: CustomDateRangeInput): this {
+    const { from, to } = custom;
+    if (!PLAIN_DATE_RE.test(from) || !PLAIN_DATE_RE.test(to)) {
+      throw new QueryAggregateValidationError(
+        `rangeBetween: "from"/"to" must be in YYYY-MM-DD format, got "${from}" / "${to}"`,
+      );
+    }
+    const { start, end } = this.utcRangeForLocalDates(from, to);
+    this._serverConditions[field] = { $gte: start, $lt: end };
+    return this;
+  }
+
+  /** Hard server-side condition for a rolling window of the last N whole calendar days (inclusive of today), in this instance's timezone. Not client-overridable. */
+  rangeLastNDays(field: string, days: number): this {
+    if (!Number.isInteger(days) || days < 1) {
+      throw new QueryAggregateValidationError(
+        `rangeLastNDays: "days" must be a positive integer, got ${days}`,
+      );
+    }
+    const tz = this.options.timezone;
+    const zonedNow = toZonedTime(new Date(), tz);
+    const todayStr = format(zonedNow, 'yyyy-MM-dd');
+    const fromStr = shiftLocalDateString(todayStr, -(days - 1));
+    const { start, end } = this.utcRangeForLocalDates(fromStr, todayStr);
+    this._serverConditions[field] = { $gte: start, $lt: end };
+    return this;
+  }
+
+  /** Hard server-side condition for a rolling window of the last N hours, ending at the moment this is called (exact UTC instants — no calendar-date snapping). Not client-overridable. */
+  rangeLastNHours(field: string, hours: number): this {
+    if (!Number.isInteger(hours) || hours < 1) {
+      throw new QueryAggregateValidationError(
+        `rangeLastNHours: "hours" must be a positive integer, got ${hours}`,
+      );
+    }
+    const end = new Date();
+    const start = new Date(end.getTime() - hours * 60 * 60 * 1000);
+    this._serverConditions[field] = { $gte: start, $lt: end };
+    return this;
+  }
+
+  /** Hard server-side condition for an explicit hour-of-day window on a given local date (e.g. 09:00–17:00 on "2026-03-14"), in this instance's timezone. `toHour` is exclusive; pass 24 for "through end of day". Not client-overridable. */
+  rangeHours(field: string, custom: CustomHourRangeInput): this {
+    const { date, fromHour, toHour } = custom;
+    if (!PLAIN_DATE_RE.test(date)) {
+      throw new QueryAggregateValidationError(
+        `rangeHours: "date" must be in YYYY-MM-DD format, got "${date}"`,
+      );
+    }
+    if (
+      !Number.isInteger(fromHour) ||
+      !Number.isInteger(toHour) ||
+      fromHour < 0 ||
+      fromHour > 24 ||
+      toHour < 0 ||
+      toHour > 24 ||
+      toHour <= fromHour
+    ) {
+      throw new QueryAggregateValidationError(
+        `rangeHours: "fromHour"/"toHour" must be integers 0–24 with toHour > fromHour, got ${fromHour} / ${toHour}`,
+      );
+    }
+    const tz = this.options.timezone;
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const start = fromZonedTime(`${date}T${pad(fromHour)}:00:00.000`, tz);
+    const end =
+      toHour === 24
+        ? fromZonedTime(`${shiftLocalDateString(date, 1)}T00:00:00.000`, tz)
+        : fromZonedTime(`${date}T${pad(toHour)}:00:00.000`, tz);
+    this._serverConditions[field] = { $gte: start, $lt: end };
+    return this;
+  }
+
+  /**
+   * Hard server-side condition for an explicit absolute datetime window.
+   * Accepts "YYYY-MM-DD" (local midnight), "YYYY-MM-DDTHH:mm:ss" (local
+   * wall-clock), or an offset-bearing ISO string (absolute instant) for
+   * both `from` and `to`. Not client-overridable.
+   */
+  rangeCustom(field: string, custom: CustomDateTimeRangeInput): this {
+    const tz = this.options.timezone;
+    const start = coerceDateScalar(custom.from, tz);
+    const end = coerceDateScalar(custom.to, tz);
+    if (!start || !end) {
+      throw new QueryAggregateValidationError(
+        `rangeCustom: could not parse "from"/"to" — got "${custom.from}" / "${custom.to}"`,
+      );
+    }
+    if (end <= start) {
+      throw new QueryAggregateValidationError(
+        `rangeCustom: "to" (${custom.to}) must be after "from" (${custom.from})`,
+      );
+    }
+    this._serverConditions[field] = { $gte: start, $lt: end };
+    return this;
+  }
+
   /** Case-insensitive full-text search across the given fields when ?q= is present. */
   globalSearch(fields: string[]): this {
     const raw = this.qs.q?.trim();
@@ -925,6 +1113,56 @@ export class QueryAggregate<T> {
     return Object.keys(finalFilter).length > 0 ? { $match: finalFilter } : null;
   }
 
+  /** Match + lookups/custom stages only, no $project/$sort — shared by count()/distinct()/stats(), which don't need either. */
+  private buildMatchAndStagesPipeline(): PipelineStage[] {
+    const pipeline: PipelineStage[] = [];
+    const matchStage = this.buildMatchStage();
+    if (matchStage) pipeline.push(matchStage);
+    pipeline.push(...this._stages);
+    return pipeline;
+  }
+
+  /** Encodes a keyset cursor from a result row: the current sort field's value plus `_id` as a stable tiebreaker. */
+  private encodeCursor(
+    doc: Record<string, unknown>,
+    sortField: string,
+  ): string {
+    const raw = doc[sortField];
+    let v: unknown = raw;
+    let t: 'date' | 'objectid' | 'other' = 'other';
+    if (raw instanceof Date) {
+      v = raw.toISOString();
+      t = 'date';
+    } else if (raw instanceof Types.ObjectId) {
+      v = raw.toString();
+      t = 'objectid';
+    }
+    const id = doc._id;
+    return Buffer.from(JSON.stringify({ v, t, id: String(id) })).toString(
+      'base64url',
+    );
+  }
+
+  /** Decodes a cursor produced by encodeCursor(), restoring Date/ObjectId typing so comparisons stay type-correct. */
+  private decodeCursor(cursor: string): { v: unknown; id: string } {
+    let parsed: { v: unknown; t?: string; id: string };
+    try {
+      parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    } catch {
+      throw new QueryAggregateValidationError('paginateCursor: invalid cursor');
+    }
+    let v = parsed.v;
+    if (parsed.t === 'date' && typeof v === 'string') v = new Date(v);
+    if (
+      parsed.t === 'objectid' &&
+      typeof v === 'string' &&
+      isValidObjectId(v)
+    ) {
+      v = new Types.ObjectId(v);
+    }
+    return { v, id: parsed.id };
+  }
+
   /** Base pipeline shared by every execution path: match -> lookups/custom stages -> project -> sort. */
   private buildBasePipeline(): PipelineStage[] {
     const pipeline: PipelineStage[] = [];
@@ -1056,6 +1294,195 @@ export class QueryAggregate<T> {
       hasNextPage: page < totalPages,
       hasPrevPage: page > 1,
     };
+  }
+
+  // ── Advanced terminal & utility methods (additive — paginate() above is
+  // untouched) ─────────────────────────────────────────────────────────────
+
+  /** Returns just the matching document count — cheaper than paginate() when you don't need the data page. Ignores $project/$sort. */
+  async count(): Promise<number> {
+    const pipeline = [
+      ...this.buildMatchAndStagesPipeline(),
+      { $count: 'count' } as PipelineStage,
+    ];
+    const [row] = await this.execAggregate<{ count: number }>(pipeline);
+    return row?.count ?? 0;
+  }
+
+  /** Returns the distinct values of `field` for the current filter/where/range conditions. */
+  async distinct<V = unknown>(field: string): Promise<V[]> {
+    const pipeline = [
+      ...this.buildMatchAndStagesPipeline(),
+      { $group: { _id: `$${field}` } } as PipelineStage,
+    ];
+    const rows = await this.execAggregate<{ _id: V }>(pipeline);
+    return rows.map((r) => r._id);
+  }
+
+  /**
+   * Computes one or more aggregate metrics (sum/avg/min/max/count) over the
+   * current filter/where/range conditions in a single round trip — handy for
+   * dashboard totals ("revenue", "avgOrderValue", "orderCount", ...).
+   * Ignores $project/$sort/pagination.
+   */
+  async stats(specs: StatSpec[]): Promise<Record<string, number>> {
+    const group: Record<string, unknown> = { _id: null };
+    for (const spec of specs) {
+      if (spec.op === 'count') {
+        group[spec.name] = { $sum: 1 };
+      } else {
+        if (!spec.field) {
+          throw new QueryAggregateValidationError(
+            `stats: metric "${spec.name}" needs a "field" for op "${spec.op}"`,
+          );
+        }
+        group[spec.name] = { [`$${spec.op}`]: `$${spec.field}` };
+      }
+    }
+
+    const pipeline = [
+      ...this.buildMatchAndStagesPipeline(),
+      { $group: group } as PipelineStage,
+    ];
+    const [row] = await this.execAggregate<Record<string, number>>(pipeline);
+
+    const out: Record<string, number> = {};
+    for (const spec of specs) out[spec.name] = row?.[spec.name] ?? 0;
+    return out;
+  }
+
+  /**
+   * Streams results as an async-iterable cursor instead of buffering the
+   * whole page in memory — use for large exports (CSV generation, bulk
+   * processing) with `for await (const doc of qa.stream())`. Ignores
+   * page/limit; add your own $limit via .addStage() if you want a cap.
+   */
+  stream(): ReturnType<ReturnType<Model<T>['aggregate']>['cursor']> {
+    const pipeline = this.buildBasePipeline();
+    const agg = this.model.aggregate<T>(pipeline);
+    if (this.options.maxTimeMS > 0)
+      agg.option({ maxTimeMS: this.options.maxTimeMS });
+    if (this.options.allowDiskUse) agg.allowDiskUse(true);
+    return agg.cursor();
+  }
+
+  /**
+   * Keyset ("seek") pagination — scales far better than .paginate()'s
+   * $skip on deep pages of large collections, at the cost of not supporting
+   * "jump to page N". Requires .sort() to have been called with exactly the
+   * field you want to seek on (falls back to DEFAULT_SORT's `createdAt`
+   * otherwise). Pass the previous page's `nextCursor` back in as `cursor`
+   * to continue; a `hasNextPage: false` / `nextCursor: null` page is the end.
+   */
+  async paginateCursor(
+    opts: CursorPaginateOptions = {},
+  ): Promise<CursorPaginatedResult<T>> {
+    const limit =
+      opts.limit && opts.limit > 0
+        ? Math.min(opts.limit, this.options.maxLimit)
+        : this._limit;
+
+    const [sortField, sortDir] = Object.entries(this._sort)[0] ?? [
+      'createdAt',
+      -1,
+    ];
+
+    const pipeline = this.buildMatchAndStagesPipeline();
+
+    if (opts.cursor) {
+      const { v, id } = this.decodeCursor(opts.cursor);
+      const cmp = sortDir === -1 ? '$lt' : '$gt';
+      const idValue = isValidObjectId(id) ? new Types.ObjectId(id) : id;
+      pipeline.push({
+        $match: {
+          $or: [
+            { [sortField]: { [cmp]: v } },
+            { [sortField]: v, _id: { [cmp]: idValue } },
+          ],
+        },
+      });
+    }
+
+    if (this._projection) pipeline.push({ $project: this._projection });
+    pipeline.push({ $sort: { [sortField]: sortDir, _id: sortDir } });
+    pipeline.push({ $limit: limit + 1 });
+
+    const rows = await this.execAggregate<Record<string, unknown>>(pipeline);
+    const hasNextPage = rows.length > limit;
+    const data = (hasNextPage ? rows.slice(0, limit) : rows) as T[];
+    const nextCursor = hasNextPage
+      ? this.encodeCursor(
+          data[data.length - 1] as unknown as Record<string, unknown>,
+          sortField,
+        )
+      : null;
+
+    return { data, limit, nextCursor, hasNextPage };
+  }
+
+  /**
+   * Runs the built pipeline through Mongoose's .explain() for debugging
+   * slow queries / verifying index usage. Never use in a hot request path —
+   * this is a development/ops tool.
+   */
+  async explain(
+    verbosity:
+      | 'queryPlanner'
+      | 'executionStats'
+      | 'allPlansExecution' = 'queryPlanner',
+  ): Promise<unknown> {
+    const pipeline = this.buildBasePipeline();
+    return this.model.aggregate(pipeline).explain(verbosity);
+  }
+
+  /** Convenience wrapper over addStage() for a computed $addFields entry, e.g. .computeField('margin', { $subtract: ['$price', '$cost'] }). */
+  computeField(name: string, expression: unknown): this {
+    return this.addStage({
+      $addFields: { [name]: expression },
+    } as PipelineStage);
+  }
+
+  /** Convenience server-side condition excluding soft-deleted docs (matches both `null` and a missing field, per MongoDB equality semantics). Not client-overridable. */
+  excludeSoftDeleted(field = 'deletedAt'): this {
+    this._serverConditions[field] = null;
+    return this;
+  }
+
+  /** Applies .where(conditions) only when `condition` is truthy — avoids scattering if-statements around chained builder calls. */
+  whereIf(
+    condition: unknown,
+    conditions: Partial<Record<keyof T, unknown>>,
+  ): this {
+    if (condition) this.where(conditions);
+    return this;
+  }
+
+  /** Deep-copies the current builder state (filters, sort, projection, stages) into a new independent instance — handy for branching one shared base query into e.g. both .paginate() and .stats() without rebuilding it twice. */
+  clone(): QueryAggregate<T> {
+    const copy = new QueryAggregate<T>(this.model, this.qs, this.options);
+    copy._allowedLookup = new Set(this._allowedLookup);
+    copy._canonicalMap = new Map(this._canonicalMap);
+    copy._dateFieldsLookup = this._dateFieldsLookup
+      ? new Set(this._dateFieldsLookup)
+      : null;
+    copy._objectIdFieldsLookup = this._objectIdFieldsLookup
+      ? new Set(this._objectIdFieldsLookup)
+      : null;
+    copy._urlFilter = { ...this._urlFilter };
+    copy._serverConditions = { ...this._serverConditions };
+    copy._searchOr = [...this._searchOr];
+    copy._sort = { ...this._sort };
+    copy._projection = this._projection ? { ...this._projection } : null;
+    copy._defaultProjection = this._defaultProjection
+      ? { ...this._defaultProjection }
+      : null;
+    copy._stages = [...this._stages];
+    return copy;
+  }
+
+  /** Returns the fully-built pipeline without executing it — for logging, snapshot tests, or sanity-checking what will actually run. */
+  debugPipeline(): PipelineStage[] {
+    return this.buildBasePipeline();
   }
 }
 
