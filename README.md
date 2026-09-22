@@ -27,6 +27,7 @@ Two fluent, chainable, allowlisted query builders for Mongoose — **`QueryFind`
   - [.paginate()](#paginate)
 - [Query Parameter Reference](#query-parameter-reference)
 - [Full Example (Express)](#full-example-express)
+- [More Examples](#more-examples)
 - [TypeScript Types](#typescript-types)
 - [Security](#security)
 - [Links](#links)
@@ -76,6 +77,8 @@ Two fluent, chainable, allowlisted query builders for Mongoose — **`QueryFind`
 - [Pipeline Stage Ordering](#pipeline-stage-ordering)
 - [Security](#security-1)
 - [TypeScript Types](#typescript-types-1)
+- [Links](#links-1)
+- [License](#license-1)
 
 ---
 
@@ -138,21 +141,21 @@ queryFind(query, queryString, options?);
 ```
 
 | Parameter     | Type                                | Description                                           |
-| ------------- | ------------------------------------ | ------------------------------------------------------ |
-| `query`       | `Query<TRawDocType[], TRawDocType>`  | A Mongoose query, e.g. `Model.find()`                   |
-| `queryString` | `QueryParams`                        | The parsed URL query object, e.g. `req.query`           |
-| `options`     | `QueryFindOptions` _(optional)_      | Configuration options (see [Options](#options) below)  |
+| ------------- | ----------------------------------- | ----------------------------------------------------- |
+| `query`       | `Query<TRawDocType[], TRawDocType>` | A Mongoose query, e.g. `Model.find()`                 |
+| `queryString` | `QueryParams`                       | The parsed URL query object, e.g. `req.query`         |
+| `options`     | `QueryFindOptions` _(optional)_     | Configuration options (see [Options](#options) below) |
 
 ### Options
 
-| Option                 | Type                                     | Default | Description                                                              |
-| ----------------------- | ----------------------------------------- | ------- | -------------------------------------------------------------------------- |
-| `maxTimeMS`             | `number`                                  | `5000`  | Max milliseconds MongoDB may spend on each query. Pass `0` to disable.    |
-| `slowQueryThresholdMS`  | `number`                                  | `maxTimeMS` | Threshold above which `onSlowQuery` fires.                             |
-| `maxLimit`              | `number`                                  | `100`   | Hard cap on `?limit=`.                                                    |
-| `lean`                  | `boolean`                                 | `true`  | Whether `.find()` calls `.lean()` for faster plain-object reads.          |
-| `onSlowQuery`           | `(info: SlowQueryInfo) => void`           | —       | Callback fired when a query exceeds `slowQueryThresholdMS`.               |
-| `onSanitizeDrop`        | `(path: string, value: unknown) => void`  | —       | Callback fired whenever sanitization drops a client-supplied value.       |
+| Option                 | Type                                     | Default     | Description                                                            |
+| ---------------------- | ---------------------------------------- | ----------- | ---------------------------------------------------------------------- |
+| `maxTimeMS`            | `number`                                 | `5000`      | Max milliseconds MongoDB may spend on each query. Pass `0` to disable. |
+| `slowQueryThresholdMS` | `number`                                 | `maxTimeMS` | Threshold above which `onSlowQuery` fires.                             |
+| `maxLimit`             | `number`                                 | `100`       | Hard cap on `?limit=`.                                                 |
+| `lean`                 | `boolean`                                | `true`      | Whether `.find()` calls `.lean()` for faster plain-object reads.       |
+| `onSlowQuery`          | `(info: SlowQueryInfo) => void`          | —           | Callback fired when a query exceeds `slowQueryThresholdMS`.            |
+| `onSanitizeDrop`       | `(path: string, value: unknown) => void` | —           | Callback fired whenever sanitization drops a client-supplied value.    |
 
 ---
 
@@ -333,13 +336,13 @@ GET /users?page=2&limit=20
 ## Query Parameter Reference
 
 | Parameter   | Example                   | Description                                            |
-| ----------- | -------------------------- | -------------------------------------------------------- |
-| `page`      | `?page=3`                  | Page number (default: `1`, min: `1`)                     |
-| `limit`     | `?limit=25`                 | Documents per page (default: `10`, max: `100`)            |
-| `sort`      | `?sort=-createdAt,name`     | Sort fields; prefix `-` for descending (max: 5 fields)    |
-| `fields`    | `?fields=name,email`        | Comma-separated fields to include in the response         |
-| `q`         | `?q=john`                   | Global search term (max: 200 chars)                        |
-| _(any key)_ | `?role=admin&age[gte]=18`   | Field-level filters processed by `.filter()`               |
+| ----------- | ------------------------- | ------------------------------------------------------ |
+| `page`      | `?page=3`                 | Page number (default: `1`, min: `1`)                   |
+| `limit`     | `?limit=25`               | Documents per page (default: `10`, max: `100`)         |
+| `sort`      | `?sort=-createdAt,name`   | Sort fields; prefix `-` for descending (max: 5 fields) |
+| `fields`    | `?fields=name,email`      | Comma-separated fields to include in the response      |
+| `q`         | `?q=john`                 | Global search term (max: 200 chars)                    |
+| _(any key)_ | `?role=admin&age[gte]=18` | Field-level filters processed by `.filter()`           |
 
 ---
 
@@ -389,6 +392,108 @@ GET /users?q=john&role=editor&sort=-createdAt&page=1&limit=5
 
 ---
 
+## More Examples
+
+**E-commerce product listing — nested price filters + category populate:**
+
+```ts
+export const getProducts = async (req: Request, res: Response) => {
+  const result = await queryFind(ProductModel.find(), req.query)
+    .allowFields(['name', 'price', 'category', 'inStock', 'brand', 'createdAt'])
+    .where({ deletedAt: null, published: true })
+    .filter()
+    .globalSearch(['name', 'brand'])
+    .sort()
+    .limitFields('name price inStock brand')
+    .populate('category', 'name slug')
+    .paginate();
+
+  res.json(result);
+};
+```
+
+```bash
+# Price between $20 and $100, in stock, sorted cheapest first
+GET /products?price[gte]=20&price[lte]=100&inStock=true&sort=price
+
+# Search "nike" across name and brand
+GET /products?q=nike&sort=-createdAt
+```
+
+**Blog posts — multiple populates + logical operators:**
+
+```ts
+export const getPosts = async (req: Request, res: Response) => {
+  const result = await queryFind(PostModel.find(), req.query)
+    .allowFields(['title', 'status', 'authorId', 'tags', 'publishedAt'])
+    .where({ deletedAt: null })
+    .filter()
+    .globalSearch(['title'])
+    .sort()
+    .limitFields('title status publishedAt')
+    .populate('authorId', 'name avatar')
+    .populate({
+      path: 'comments',
+      select: 'text createdAt',
+      match: { visible: true },
+    })
+    .paginate();
+
+  res.json(result);
+};
+```
+
+```bash
+# Published OR featured posts, using the safe top-level $or
+GET /posts?$or[0][status]=published&$or[1][featured]=true
+
+# Posts tagged "typescript" published this year
+GET /posts?tags=typescript&publishedAt[gte]=2026-01-01
+```
+
+**Admin panel — strict field allowlist, sensitive fields never leak:**
+
+```ts
+export const adminListUsers = async (req: Request, res: Response) => {
+  const result = await queryFind(UserModel.find(), req.query, { maxLimit: 250 })
+    .allowFields(['name', 'email', 'role', 'isActive', 'lastLoginAt'])
+    .where({ orgId: req.user.orgId })
+    .filter()
+    .sort()
+    .limitFields('-password -passwordResetToken -__v') // client's ?fields= can never override this
+    .paginate();
+
+  res.json(result);
+};
+```
+
+```bash
+# Even if a client tries ?fields=password, it's stripped — not in allowFields()
+GET /admin/users?fields=password,email&role=admin
+```
+
+**Cached count pattern — skip re-counting on subsequent pages:**
+
+```ts
+export const getNotifications = async (req: Request, res: Response) => {
+  const builder = queryFind(NotificationModel.find(), req.query)
+    .allowFields(['userId', 'read', 'createdAt'])
+    .where({ userId: req.user.id })
+    .filter()
+    .sort();
+
+  // First request from the client includes no cachedTotal
+  const cachedTotal = req.query.cachedTotal
+    ? Number(req.query.cachedTotal)
+    : undefined;
+  const result = await builder.paginate(cachedTotal);
+
+  res.json(result); // client stores result.total and sends it back as ?cachedTotal= on the next page
+};
+```
+
+---
+
 ## TypeScript Types
 
 All types are exported:
@@ -427,10 +532,10 @@ interface PaginatedResult<T> {
 }
 
 interface QueryFindOptions {
-  maxTimeMS?: number;             // default: 5000
-  slowQueryThresholdMS?: number;  // default: maxTimeMS
-  maxLimit?: number;              // default: 100
-  lean?: boolean;                 // default: true
+  maxTimeMS?: number; // default: 5000
+  slowQueryThresholdMS?: number; // default: maxTimeMS
+  maxLimit?: number; // default: 100
+  lean?: boolean; // default: true
   onSlowQuery?: (info: SlowQueryInfo) => void;
   onSanitizeDrop?: (path: string, value: unknown) => void;
 }
@@ -448,17 +553,17 @@ interface SlowQueryInfo {
 
 ## Security
 
-| Protection                  | Detail                                                                                    |
-| ---------------------------- | -------------------------------------------------------------------------------------------- |
-| **NoSQL injection**          | Allowlist enforced on filters, sort, and projection via `.allowFields()`                     |
-| **Banned operators**         | `$where`, `$expr`, `$function`, and others are rejected recursively at any nesting depth     |
-| **ReDoS**                    | Search terms are regex-escaped before compilation                                            |
-| **Oversized search**         | `?q=` capped at 200 characters                                                                |
-| **Deep nesting DoS**         | Filter object nesting capped at depth 5                                                        |
-| **Page size DoS**            | `limit` hard-capped at 100                                                                     |
-| **Sort abuse**               | Sort fields hard-capped at 5                                                                    |
-| **Runaway queries**          | `maxTimeMS` applied to both count and find (default: 5s)                                       |
-| **Sensitive field leakage**  | `?fields=` projection stripped against allowlist                                               |
+| Protection                  | Detail                                                                                   |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| **NoSQL injection**         | Allowlist enforced on filters, sort, and projection via `.allowFields()`                 |
+| **Banned operators**        | `$where`, `$expr`, `$function`, and others are rejected recursively at any nesting depth |
+| **ReDoS**                   | Search terms are regex-escaped before compilation                                        |
+| **Oversized search**        | `?q=` capped at 200 characters                                                           |
+| **Deep nesting DoS**        | Filter object nesting capped at depth 5                                                  |
+| **Page size DoS**           | `limit` hard-capped at 100                                                               |
+| **Sort abuse**              | Sort fields hard-capped at 5                                                             |
+| **Runaway queries**         | `maxTimeMS` applied to both count and find (default: 5s)                                 |
+| **Sensitive field leakage** | `?fields=` projection stripped against allowlist                                         |
 
 ---
 
@@ -502,17 +607,17 @@ A fluent, allowlisted **aggregation-pipeline** builder for Mongoose (`^8 || ^9`)
 
 ## When to use QueryAggregate vs QueryFind
 
-| Need                                                          | Use              |
-| ---------------------------------------------------------------- | ------------------ |
-| Simple filter/sort/paginate on one collection                    | `QueryFind`        |
-| Joining another collection (`$lookup`)                            | `QueryAggregate`   |
-| Grouping / rollups / computed fields (`$group`, `$addFields`)     | `QueryAggregate`   |
-| Client filters need to respect the caller's local timezone        | `QueryAggregate`   |
-| A custom day / date span / rolling window / hour-of-day filter    | `QueryAggregate`   |
-| Dashboard totals (sum/avg/count) without fetching a page          | `QueryAggregate`   |
-| Very large collections where `$skip` pagination gets slow         | `QueryAggregate`   |
-| Streaming a large export without buffering it in memory           | `QueryAggregate`   |
-| You need a custom developer-defined pipeline stage                 | `QueryAggregate`   |
+| Need                                                           | Use              |
+| -------------------------------------------------------------- | ---------------- |
+| Simple filter/sort/paginate on one collection                  | `QueryFind`      |
+| Joining another collection (`$lookup`)                         | `QueryAggregate` |
+| Grouping / rollups / computed fields (`$group`, `$addFields`)  | `QueryAggregate` |
+| Client filters need to respect the caller's local timezone     | `QueryAggregate` |
+| A custom day / date span / rolling window / hour-of-day filter | `QueryAggregate` |
+| Dashboard totals (sum/avg/count) without fetching a page       | `QueryAggregate` |
+| Very large collections where `$skip` pagination gets slow      | `QueryAggregate` |
+| Streaming a large export without buffering it in memory        | `QueryAggregate` |
+| You need a custom developer-defined pipeline stage             | `QueryAggregate` |
 
 ## Installation
 
@@ -562,23 +667,23 @@ new QueryAggregate<T>(model, queryString, options?);
 ```
 
 | Parameter     | Type                    | Description                                     |
-| ------------- | ------------------------ | -------------------------------------------------- |
-| `model`       | `Model<T>`               | A Mongoose model                                    |
-| `queryString` | `QueryParams`             | Parsed URL query object, e.g. `req.query`           |
-| `options`     | `QueryAggregateOptions`   | Configuration options (see below), all optional     |
+| ------------- | ----------------------- | ----------------------------------------------- |
+| `model`       | `Model<T>`              | A Mongoose model                                |
+| `queryString` | `QueryParams`           | Parsed URL query object, e.g. `req.query`       |
+| `options`     | `QueryAggregateOptions` | Configuration options (see below), all optional |
 
 ### `QueryAggregateOptions`
 
-| Option                 | Type                                     | Default        | Description                                                                                                                                                     |
-| ------------------------ | ------------------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timezone`              | `string`                                    | `'Asia/Dhaka'`   | IANA timezone for interpreting client-supplied local dates. Invalid values fall back to the default (validated once at construction, never throws mid-query).    |
-| `maxTimeMS`             | `number`                                    | `5000`           | Max time MongoDB may spend per query. `0` disables.                                                                                                              |
-| `slowQueryThresholdMS`  | `number`                                    | `maxTimeMS`      | Threshold above which `onSlowQuery` fires.                                                                                                                        |
-| `maxLimit`              | `number`                                    | `100`            | Hard cap on `?limit=`.                                                                                                                                              |
-| `allowDiskUse`          | `boolean`                                   | `false`          | Forwarded to `.allowDiskUse()` — enable for large sort/group pipelines.                                                                                            |
-| `weekStartsOn`          | `0–6`                                       | `6` (Saturday)   | Used by `.range('thisWeek')`.                                                                                                                                      |
-| `onSlowQuery`           | `(info: SlowQueryInfo) => void`             | —                | Callback fired when a query exceeds `slowQueryThresholdMS`.                                                                                                       |
-| `onSanitizeDrop`        | `(path: string, value: unknown) => void`    | —                | Callback fired whenever sanitization drops a value (bad nesting, non-plain value).                                                                                 |
+| Option                 | Type                                     | Default        | Description                                                                                                                                                   |
+| ---------------------- | ---------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timezone`             | `string`                                 | `'Asia/Dhaka'` | IANA timezone for interpreting client-supplied local dates. Invalid values fall back to the default (validated once at construction, never throws mid-query). |
+| `maxTimeMS`            | `number`                                 | `5000`         | Max time MongoDB may spend per query. `0` disables.                                                                                                           |
+| `slowQueryThresholdMS` | `number`                                 | `maxTimeMS`    | Threshold above which `onSlowQuery` fires.                                                                                                                    |
+| `maxLimit`             | `number`                                 | `100`          | Hard cap on `?limit=`.                                                                                                                                        |
+| `allowDiskUse`         | `boolean`                                | `false`        | Forwarded to `.allowDiskUse()` — enable for large sort/group pipelines.                                                                                       |
+| `weekStartsOn`         | `0–6`                                    | `6` (Saturday) | Used by `.range('thisWeek')`.                                                                                                                                 |
+| `onSlowQuery`          | `(info: SlowQueryInfo) => void`          | —              | Callback fired when a query exceeds `slowQueryThresholdMS`.                                                                                                   |
+| `onSanitizeDrop`       | `(path: string, value: unknown) => void` | —              | Callback fired whenever sanitization drops a value (bad nesting, non-plain value).                                                                            |
 
 ## Timezone Handling
 
@@ -813,14 +918,14 @@ Controls the `$project` stage. Accepts a space-separated string (`"name status -
 
 Adds a `$lookup` (join) stage, optionally followed by `$unwind`.
 
-| Field          | Type               | Description                                                                                                                          |
-| -------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `from`         | `string`             | Collection name (not the model name) to join against.                                                                                    |
-| `as`           | `string`             | Output array field name.                                                                                                                  |
-| `localField`   | `string?`            | Local join field.                                                                                                                         |
-| `foreignField` | `string?`            | Foreign join field.                                                                                                                       |
-| `pipeline`     | `PipelineStage[]?`   | Sub-pipeline form of `$lookup`, for complex/correlated joins. Cannot contain `$out`/`$merge`.                                             |
-| `single`       | `boolean?`           | When `true`, `$unwind`s the joined array (`preserveNullAndEmptyArrays: true`) so `as` becomes a single object instead of an array.        |
+| Field          | Type               | Description                                                                                                                        |
+| -------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `from`         | `string`           | Collection name (not the model name) to join against.                                                                              |
+| `as`           | `string`           | Output array field name.                                                                                                           |
+| `localField`   | `string?`          | Local join field.                                                                                                                  |
+| `foreignField` | `string?`          | Foreign join field.                                                                                                                |
+| `pipeline`     | `PipelineStage[]?` | Sub-pipeline form of `$lookup`, for complex/correlated joins. Cannot contain `$out`/`$merge`.                                      |
+| `single`       | `boolean?`         | When `true`, `$unwind`s the joined array (`preserveNullAndEmptyArrays: true`) so `as` becomes a single object instead of an array. |
 
 ```ts
 .lookup({
@@ -891,7 +996,7 @@ Keyset ("seek") pagination — scales far better than `.paginate()`'s `$skip` on
 ```ts
 interface CursorPaginateOptions {
   cursor?: string; // opaque cursor from a previous page's nextCursor
-  limit?: number;  // overrides ?limit=, still capped by maxLimit
+  limit?: number; // overrides ?limit=, still capped by maxLimit
 }
 
 interface CursorPaginatedResult<T> {
@@ -1051,7 +1156,11 @@ const result = await new QueryAggregate(OrderModel, req.query, { timezone })
 const result = await new QueryAggregate(OrderModel, req.query, { timezone })
   .allowFields(['status'])
   .where({ branchId: req.self.linkedTo })
-  .rangeHours('createdAt', { date: req.query.day as string, fromHour: 9, toHour: 21 })
+  .rangeHours('createdAt', {
+    date: req.query.day as string,
+    fromHour: 9,
+    toHour: 21,
+  })
   .filter()
   .sort()
   .paginate();
@@ -1110,6 +1219,80 @@ for await (const row of builder.stream()) {
 res.end();
 ```
 
+**ObjectId filter fields (ref lookups by hex ID from the URL):**
+
+```
+GET /orders?branchId=64f1a2b3c4d5e6f7a8b9c0d1&categoryId=64f1a2b3c4d5e6f7a8b9c0d2
+```
+
+```ts
+const result = await new QueryAggregate(OrderModel, req.query, { timezone })
+  .allowFields(['branchId', 'categoryId', 'status'])
+  .objectIdFields(['branchId', 'categoryId']) // coerces hex strings -> Types.ObjectId
+  .filter()
+  .sort()
+  .paginate();
+```
+
+**Role-based server conditions with `.whereIf()` + `.excludeSoftDeleted()`:**
+
+```ts
+const result = await new QueryAggregate(OrderModel, req.query, { timezone })
+  .allowFields(['status', 'branchId', 'createdAt'])
+  .excludeSoftDeleted() // deletedAt: null, always applied
+  .whereIf(req.self.role !== 'admin', { branchId: req.self.linkedTo }) // branch staff see only their branch
+  .whereIf(req.query.vip === 'true', { tier: 'vip' })
+  .filter()
+  .sort()
+  .paginate();
+```
+
+**Populating a filter UI — distinct values + count, no data fetch:**
+
+```ts
+const builder = new QueryAggregate(OrderModel, req.query, { timezone })
+  .allowFields(['status', 'branchId'])
+  .where({ branchId: req.self.linkedTo })
+  .filter();
+
+const [statuses, total] = await Promise.all([
+  builder.clone().distinct('status'), // populate a <select> of possible statuses
+  builder.clone().count(), // "X results" label
+]);
+```
+
+**Debug route — inspect the built pipeline / query plan without exposing it to normal users:**
+
+```ts
+router.get('/orders/_debug', requireAdmin, async (req, res) => {
+  const builder = new QueryAggregate(OrderModel, req.query, { timezone })
+    .allowFields(['status', 'createdAt'])
+    .where({ branchId: req.self.linkedTo })
+    .range('createdAt', 'last7Days')
+    .filter()
+    .sort();
+
+  res.json({
+    pipeline: builder.debugPipeline(),
+    explain: await builder.explain('executionStats'),
+  });
+});
+```
+
+**Cursor pagination on a non-default sort field:**
+
+```ts
+const result = await new QueryAggregate(ProductModel, req.query, { timezone })
+  .allowFields(['price', 'name'])
+  .where({ inStock: true })
+  .filter()
+  .sort() // resolves ?sort=price into { price: 1 } — paginateCursor() will seek on "price"
+  .paginateCursor({
+    cursor: req.query.cursor as string | undefined,
+    limit: 24,
+  });
+```
+
 **Correlated sub-pipeline `$lookup` (needs `let`):**
 
 The built-in `LookupOptions` type doesn't expose `let` for correlated sub-pipelines. For that case, drop to `.addStage()` directly:
@@ -1126,6 +1309,100 @@ The built-in `LookupOptions` type doesn't expose `let` for correlated sub-pipeli
     as: 'items',
   },
 })
+```
+
+**Sales analytics dashboard — join, group, and rolling window in one pipeline:**
+
+```ts
+const timezone = (req.headers['x-timezone'] as string) ?? 'Asia/Dhaka';
+
+const result = await new QueryAggregate(OrderModel, req.query, { timezone })
+  .allowFields(['branchId', 'status'])
+  .where({ status: 'PAID' })
+  .rangeLastNDays('createdAt', 30) // rolling 30-day window, client can't override
+  .filter()
+  .lookup({
+    from: 'branches',
+    as: 'branch',
+    localField: 'branchId',
+    foreignField: '_id',
+    single: true,
+  })
+  .addStage({
+    $group: {
+      _id: '$branchId',
+      branchName: { $first: '$branch.name' },
+      revenue: { $sum: '$total' },
+      orders: { $sum: 1 },
+      avgOrderValue: { $avg: '$total' },
+    },
+  })
+  .addStage({ $sort: { revenue: -1 } })
+  .paginate();
+```
+
+**Notification feed — lookup + unwind a single related document per row:**
+
+```ts
+const result = await new QueryAggregate(NotificationModel, req.query, {
+  timezone,
+})
+  .allowFields(['read', 'type', 'createdAt'])
+  .dateFields(['createdAt'])
+  .where({ userId: req.user.id })
+  .filter()
+  .lookup({
+    from: 'users',
+    as: 'actor',
+    localField: 'actorId',
+    foreignField: '_id',
+    single: true, // unwinds so `actor` is a single object, not an array
+  })
+  .sort()
+  .project('type read createdAt actor.name actor.avatar')
+  .paginate();
+```
+
+**Audit log search — global search + a bounded absolute datetime window:**
+
+```ts
+const result = await new QueryAggregate(AuditLogModel, req.query, { timezone })
+  .allowFields(['action', 'actorId', 'createdAt'])
+  .dateFields(['createdAt'])
+  .where({ orgId: req.user.orgId })
+  .rangeCustom('createdAt', {
+    from: (req.query.from as string) ?? '2026-01-01T00:00:00',
+    to: (req.query.to as string) ?? new Date().toISOString(),
+  })
+  .filter()
+  .globalSearch(['action'])
+  .sort()
+  .project('action actorId createdAt')
+  .paginate();
+```
+
+**Multi-branch inventory report — objectIdFields + computeField + stats side by side:**
+
+```ts
+const base = new QueryAggregate(ProductModel, req.query, { timezone })
+  .allowFields(['branchId', 'category', 'stock', 'price'])
+  .objectIdFields(['branchId'])
+  .where({ deletedAt: null })
+  .filter()
+  .computeField('stockValue', { $multiply: ['$stock', '$price'] })
+  .sort()
+  .project('branchId category stock price stockValue');
+
+const [page, totals] = await Promise.all([
+  base.clone().paginate(),
+  base.clone().stats([
+    { name: 'totalStockValue', op: 'sum', field: 'stockValue' },
+    { name: 'lowStockAvg', op: 'avg', field: 'stock' },
+    { name: 'skuCount', op: 'count' },
+  ]),
+]);
+
+res.json({ ...page, totals });
 ```
 
 ## Pipeline Stage Ordering
@@ -1154,22 +1431,22 @@ Implications:
 
 ## Security
 
-| Protection                        | Detail                                                                                                                          |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| **NoSQL injection**                | Allowlist enforced on `.filter()`/`.sort()`/`.project()` via `.allowFields()`                                                    |
-| **Banned operators**               | `$where`, `$expr`, `$function`, `$accumulator`, `$map`, `$reduce`, `$filter` rejected recursively, any depth, in client input      |
-| **Destructive stages**             | `$out` / `$merge` rejected in `.addStage()` / `.lookup()` sub-pipelines                                                            |
-| **ReDoS**                          | `.globalSearch()` terms are regex-escaped before compilation                                                                      |
-| **Oversized search**               | `?q=` capped at 200 characters                                                                                                     |
-| **Deep nesting DoS**               | Client filter object nesting capped at depth 5 (`sanitize()`)                                                                     |
-| **Page size DoS**                  | `limit` hard-capped at `maxLimit` (default 100), including in `.paginateCursor()`                                                  |
-| **Sort abuse**                     | Sort fields hard-capped at 5                                                                                                       |
-| **Runaway queries**                | `maxTimeMS` applied to the aggregation; `onSlowQuery` for observability                                                            |
-| **Bad timezone input**             | Invalid IANA zone validated once at construction, falls back to default, never throws mid-query                                    |
-| **Bad custom-range input**         | `rangeCustomDay`/`rangeBetween`/`rangeLastNDays`/`rangeLastNHours`/`rangeHours`/`rangeCustom` all throw `QueryAggregateValidationError` on malformed dates, non-positive counts, or invalid hour bounds — never silently produce a wrong range |
-| **Server condition override**      | `.where()` / `.range()` / every custom range method are merged last via `$and` — URL params can never override them               |
-| **Tampered cursors**               | `.paginateCursor()` cursors are opaque base64url-encoded JSON; a malformed cursor throws `QueryAggregateValidationError` rather than silently misbehaving |
-| **Untrusted `.addStage()` input**  | Not sanitized/allowlisted by design — documented as a trusted, developer-authored-only escape hatch                                |
+| Protection                        | Detail                                                                                                                                                                                                                                         |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **NoSQL injection**               | Allowlist enforced on `.filter()`/`.sort()`/`.project()` via `.allowFields()`                                                                                                                                                                  |
+| **Banned operators**              | `$where`, `$expr`, `$function`, `$accumulator`, `$map`, `$reduce`, `$filter` rejected recursively, any depth, in client input                                                                                                                  |
+| **Destructive stages**            | `$out` / `$merge` rejected in `.addStage()` / `.lookup()` sub-pipelines                                                                                                                                                                        |
+| **ReDoS**                         | `.globalSearch()` terms are regex-escaped before compilation                                                                                                                                                                                   |
+| **Oversized search**              | `?q=` capped at 200 characters                                                                                                                                                                                                                 |
+| **Deep nesting DoS**              | Client filter object nesting capped at depth 5 (`sanitize()`)                                                                                                                                                                                  |
+| **Page size DoS**                 | `limit` hard-capped at `maxLimit` (default 100), including in `.paginateCursor()`                                                                                                                                                              |
+| **Sort abuse**                    | Sort fields hard-capped at 5                                                                                                                                                                                                                   |
+| **Runaway queries**               | `maxTimeMS` applied to the aggregation; `onSlowQuery` for observability                                                                                                                                                                        |
+| **Bad timezone input**            | Invalid IANA zone validated once at construction, falls back to default, never throws mid-query                                                                                                                                                |
+| **Bad custom-range input**        | `rangeCustomDay`/`rangeBetween`/`rangeLastNDays`/`rangeLastNHours`/`rangeHours`/`rangeCustom` all throw `QueryAggregateValidationError` on malformed dates, non-positive counts, or invalid hour bounds — never silently produce a wrong range |
+| **Server condition override**     | `.where()` / `.range()` / every custom range method are merged last via `$and` — URL params can never override them                                                                                                                            |
+| **Tampered cursors**              | `.paginateCursor()` cursors are opaque base64url-encoded JSON; a malformed cursor throws `QueryAggregateValidationError` rather than silently misbehaving                                                                                      |
+| **Untrusted `.addStage()` input** | Not sanitized/allowlisted by design — documented as a trusted, developer-authored-only escape hatch                                                                                                                                            |
 
 > **Important:** `.addStage()` and the `pipeline` option in `.lookup()` are for **server-defined stages only**. They skip the sanitizer/allowlist/operator-rejection that protects `.filter()`/`.where()`. Never interpolate raw `req.query`/`req.body` values into an `.addStage()` call without validating them yourself first.
 
@@ -1239,13 +1516,13 @@ type CustomDayInput = string; // "YYYY-MM-DD"
 
 interface CustomDateRangeInput {
   from: string; // "YYYY-MM-DD"
-  to: string;   // "YYYY-MM-DD"
+  to: string; // "YYYY-MM-DD"
 }
 
 interface CustomHourRangeInput {
-  date: string;     // "YYYY-MM-DD"
+  date: string; // "YYYY-MM-DD"
   fromHour: number; // 0–24
-  toHour: number;   // 0–24, exclusive, must be > fromHour
+  toHour: number; // 0–24, exclusive, must be > fromHour
 }
 
 interface CustomDateTimeRangeInput {
@@ -1273,3 +1550,17 @@ interface StatSpec {
   field?: string;
 }
 ```
+
+---
+
+## Links
+
+- [npm](https://www.npmjs.com/package/mongoose-query-find)
+- [GitHub](https://github.com/jsdev-robin/mongoose-query-find)
+- [Issues](https://github.com/jsdev-robin/mongoose-query-find/issues)
+
+---
+
+## License
+
+ISC © [jsdev.robin@gmail.com](mailto:jsdev.robin@gmail.com)
