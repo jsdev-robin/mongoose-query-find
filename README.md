@@ -4,7 +4,7 @@
 [![license](https://img.shields.io/npm/l/mongoose-query-find)](https://github.com/jsdev-robin/mongoose-query-find/blob/main/LICENSE)
 [![mongoose peer](https://img.shields.io/badge/mongoose-%5E8%20%7C%7C%20%5E9-brightgreen)](https://mongoosejs.com)
 
-Two fluent, chainable, allowlisted query builders for Mongoose — **`QueryFind`** for simple `Model.find()` queries, and **`QueryAggregate`** for anything that needs joins, grouping, timezone-aware date filtering, or advanced pagination. Both are driven directly from URL query parameters with zero boilerplate.
+Three fluent, chainable, allowlisted query builders for Mongoose — **`QueryFind`** for simple `Model.find()` queries, **`QueryAggregate`** for anything that needs joins, grouping, timezone-aware date filtering, or advanced pagination, and **`QueryAnalytics`** for dashboards and reporting (time series, cohorts, funnels, sessionization, and more). All three are driven directly from URL query parameters with zero boilerplate.
 
 ---
 
@@ -79,6 +79,51 @@ Two fluent, chainable, allowlisted query builders for Mongoose — **`QueryFind`
 - [TypeScript Types](#typescript-types-1)
 - [Links](#links-1)
 - [License](#license-1)
+
+**QueryAnalytics**
+
+- [Overview](#queryanalytics-overview)
+- [When to use QueryAnalytics](#when-to-use-queryanalytics)
+- [Installation](#installation-2)
+- [Quick Start](#quick-start-2)
+- [Constructor & Options](#constructor--options-2)
+- [Base Filter Methods](#base-filter-methods)
+  - [.match()](#matchconditions)
+  - [.dateRange()](#daterangefield-string-range--from-string-to-string-)
+  - [.addStage()](#addstagestage-pipelinestage-1)
+  - [.clone()](#clone-1)
+- [Time Series](#time-series)
+  - [.timeSeries()](#timeseriesopts)
+  - [.cumulativeSeries()](#cumulativeseriesopts)
+- [Comparisons & Breakdowns](#comparisons--breakdowns)
+  - [.compare()](#compareopts)
+  - [.breakdown()](#breakdownfield-metrics-opts)
+  - [.rankedBreakdown()](#rankedbreakdownfield-metrics-opts)
+  - [.multiBreakdown()](#multibreakdownfields-metrics-opts)
+- [Funnels & Cohorts](#funnels--cohorts)
+  - [.funnel()](#funnelsteps)
+  - [.cohortRetention()](#cohortretentionopts)
+  - [.sessionize()](#sessionizeopts)
+- [Statistics](#statistics)
+  - [.percentiles()](#percentilesfield-ps)
+  - [.stdDevOutliers()](#stddevoutliersfield-opts)
+  - [.metrics()](#metricsspecs)
+- [Post-Processing Helpers (static)](#post-processing-helpers-static)
+  - [QueryAnalytics.movingAverage()](#queryanalyticsmovingaverage)
+  - [QueryAnalytics.trend()](#queryanalyticstrend)
+  - [QueryAnalytics.forecast()](#queryanalyticsforecast)
+- [.heatmap()](#heatmapdatefield-valuefield)
+- [Live Updates](#live-updates)
+  - [.watch()](#watchonchange-opts)
+- [Export & Batch Helpers (static)](#export--batch-helpers-static)
+  - [QueryAnalytics.toCSV() / toNDJSON()](#queryanalyticstocsv--tondjson)
+  - [QueryAnalytics.dashboard()](#queryanalyticsdashboard)
+  - [QueryAnalytics.clearCache()](#queryanalyticsclearcache)
+- [Recipes](#recipes-1)
+- [Security](#security-2)
+- [TypeScript Types](#typescript-types-2)
+- [Links](#links-2)
+- [License](#license-2)
 
 ---
 

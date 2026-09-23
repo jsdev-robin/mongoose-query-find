@@ -1,19 +1,46 @@
 // Classes + factory
-export { QueryFind, queryFind } from './find';
 export { QueryAggregate } from './aggregate';
+export { QueryAnalytics } from './analytics';
+export { QueryFind, queryFind } from './find';
 
 // Shared types (defined identically in both files — sourced from ./find to avoid duplicate-export conflicts)
-export type { QueryParams, PaginatedResult } from './find';
+export type { PaginatedResult, QueryParams } from './find';
 
 // QueryFind-only types & errors
-export type { QueryFindOptions, SlowQueryInfo as FindSlowQueryInfo } from './find';
 export { QueryFindError, QueryFindValidationError } from './find';
+export type {
+  SlowQueryInfo as FindSlowQueryInfo,
+  QueryFindOptions,
+} from './find';
 
 // QueryAggregate-only types & errors
-export type {
-  QueryAggregateOptions,
-  LookupOptions,
-  RangePreset,
-  SlowQueryInfo as AggregateSlowQueryInfo,
+export {
+  QueryAggregateError,
+  QueryAggregateValidationError,
 } from './aggregate';
-export { QueryAggregateError, QueryAggregateValidationError } from './aggregate';
+export type {
+  SlowQueryInfo as AggregateSlowQueryInfo,
+  LookupOptions,
+  QueryAggregateOptions,
+  RangePreset,
+} from './aggregate';
+
+// QueryAnalytics-only types & errors
+export { QueryAnalyticsError } from './analytics';
+export type {
+  StatSpec as AnalyticsStatSpec,
+  BreakdownRow,
+  CohortRetentionOptions,
+  CohortRow,
+  ComparePreset,
+  CompareResult,
+  FunnelResult,
+  FunnelStep,
+  Interval,
+  OutlierRow,
+  QueryAnalyticsOptions,
+  RankedBreakdownRow,
+  SessionizeOptions,
+  SessionSummary,
+  TimeSeriesPoint,
+} from './analytics';
