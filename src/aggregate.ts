@@ -604,7 +604,9 @@ function coerceDateValue(
       case undefined:
         return { $gte: start, $lt: end };
       case 'gt':
-        return end;
+        // "after the whole day" -> $gt (end - 1ms), so a doc stamped exactly at
+        // next-day 00:00:00.000 is included (returning `end` would drop it).
+        return new Date(end.getTime() - 1);
       case 'lte':
         return new Date(end.getTime() - 1);
       default: // gte / lt / eq / ne (eq/ne are normally intercepted earlier)
@@ -919,6 +921,46 @@ function normalizeProjectionObject(
       : exc;
   }
   return normalizeProjection(inc, exc);
+}
+
+/**
+ * Applies a client-requested exclusion-only projection ("-name") ON TOP of the
+ * developer's default projection instead of replacing it. Without this, a
+ * client sending ?fields=-name would turn the projection into { name: 0 },
+ * which returns every other field — including fields that are not allowlisted
+ * and fields the default projection deliberately hid.
+ */
+function applyClientExclusions(
+  clientExc: Record<string, 0 | 1>,
+  defaultProj: Record<string, 0 | 1> | null,
+): Record<string, 0 | 1> {
+  if (!defaultProj) return clientExc;
+
+  const defaultIsInclusion = Object.keys(defaultProj).some(
+    (k) => k !== '_id' && defaultProj[k] === 1,
+  );
+
+  if (!defaultIsInclusion) {
+    // Default is itself exclusion-only: union of both exclusion sets.
+    return { ...defaultProj, ...clientExc };
+  }
+
+  const out: Record<string, 0 | 1> = { ...defaultProj };
+  for (const ex of Object.keys(clientExc)) {
+    if (ex === '_id') {
+      out._id = 0;
+      continue;
+    }
+    for (const k of Object.keys(out)) {
+      if (k === ex || k.startsWith(`${ex}.`)) delete out[k];
+    }
+  }
+  // If nothing is left to include, never degrade into an exclusion-only
+  // projection (that would return every field) — keep the default instead.
+  const stillInclusion = Object.keys(out).some(
+    (k) => k !== '_id' && out[k] === 1,
+  );
+  return stillInclusion ? out : { ...defaultProj };
 }
 
 // ─── Misc helpers ─────────────────────────────────────────────────────────────
@@ -1399,8 +1441,15 @@ export class QueryAggregate<T> {
         this._canonicalMap,
       );
       const obj = sanitized ? projectionStringToObject(sanitized) : {};
+      const keys = Object.keys(obj);
+      const isExclusionOnly =
+        keys.length > 0 && keys.every((k) => obj[k] === 0);
       this._projection =
-        Object.keys(obj).length > 0 ? obj : this._defaultProjection;
+        keys.length === 0
+          ? this._defaultProjection
+          : isExclusionOnly
+            ? applyClientExclusions(obj, this._defaultProjection)
+            : obj;
     } else {
       this._projection = this._defaultProjection;
     }
