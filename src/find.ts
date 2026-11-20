@@ -8,43 +8,56 @@
  * QueryFind is a safe, allowlisted, and fully-featured query builder for
  * Mongoose that:
  *  - Parses and sanitizes URL query parameters into Mongoose-friendly filters
- *  - Coerces string booleans and date strings into proper types
- *  - Supports safe top-level logical operators ($and / $or / $nor / $not)
+ *  - Coerces string booleans and date strings into proper types (timezone-aware)
+ *  - Supports safe top-level logical operators ($and / $or / $nor)
  *  - Enforces an allowlist for fields that may be filtered, sorted, or selected
  *  - Provides global (case-insensitive) regex search across specified fields
  *  - Supports population, select (projection), sorting, and pagination
  *  - Emits slow-query notifications when configured
  *
- * New: maxLimit option (customizable)
- * ----------------------------------
- * By default the per-page `limit` is capped at 100. You can override this
- * by passing `maxLimit` in the QueryFind options:
+ * ── Timezone handling ───────────────────────────────────────────────────────
+ * MongoDB always stores/compares dates in UTC. Clients think and filter in local
+ * time (e.g. ?createdAt=2026-09-01 means "Sept 1st in the caller's timezone",
+ * not UTC midnight). This builder resolves that with `date-fns-tz`:
  *
- * const result = await queryFind(User.find(), req.query, { maxLimit: 250 }).paginate();
+ *   - fromZonedTime(localString, tz) -> the exact UTC instant for a wall-clock
+ *     time in `tz`. Used to turn a client-supplied local date into the correct
+ *     $gte/$lt UTC range.
  *
- * If the client requests ?limit=500 but maxLimit is 250, the effective limit
- * will be min(requestedLimit, maxLimit).
+ * The timezone is a per-request value, passed via the options object rather
+ * than hardcoded, typically sourced from a header:
+ *
+ *   const timezone = (req.headers['x-timezone'] as string) ?? 'Asia/Dhaka';
+ *   const result = await queryFind(User.find(), req.query, { timezone })...
+ *
+ * An invalid/unknown IANA timezone string never throws mid-query — it is
+ * validated once at construction time and falls back to the default.
+ *
+ * Date coercion rules (for date-like fields):
+ *   - "YYYY-MM-DD"                 -> whole local day [00:00, next 00:00) in tz
+ *   - "YYYY-MM-DDTHH:mm:ss[.sss]"  -> local wall-clock time in tz
+ *   - ISO string with Z / +06:00   -> absolute instant (timezone not applied)
+ *   - ?createdAt[gte]=2026-09-01   -> start of that local day
+ *   - ?createdAt[lte]=2026-09-30   -> last millisecond of that local day
+ *   - ?createdAt[gt]=...  [lt]=... -> end / start of that local day
+ *   - ?createdAt[eq]=... / [ne]=...-> whole-day range / negated whole-day range
  *
  * Installation
  * ------------
- * npm:
- *   npm install mongoose-query-find
- *
- * Yarn:
- *   yarn add mongoose-query-find
+ *   npm install mongoose-query-find date-fns-tz
  *
  * Usage
  * -----
- * Example typical usage inside an Express route handler:
- *
  * import { queryFind } from 'mongoose-query-find';
  * import User from './models/User';
  *
  * app.get('/users', async (req, res, next) => {
  *   try {
+ *     const timezone = (req.headers['x-timezone'] as string) ?? 'Asia/Dhaka';
  *     const result = await queryFind(User.find(), req.query, {
+ *       timezone,
  *       maxTimeMS: 2000,
- *       maxLimit: 250, // <- custom max limit per page
+ *       maxLimit: 250,
  *       onSlowQuery(info) {
  *         console.warn('Slow query', info);
  *       },
@@ -67,27 +80,22 @@
  * API (high-level)
  * ----------------
  * - queryFind(query, queryString, options?) -> QueryFind
- *   Factory convenience wrapper around `new QueryFind(...)`.
- *
  * - new QueryFind(query, queryString, options?)
- *   Constructor parameters:
- *     - query: a Mongoose Query instance (e.g. Model.find())
- *     - queryString: parsed URL query parameters (e.g. req.query)
- *     - options (optional):
- *         - maxTimeMS?: number (default: 5000)
+ *     options (optional):
+ *         - timezone?: string            IANA tz (default: 'Asia/Dhaka')
+ *         - maxTimeMS?: number           (default: 5000)
  *         - slowQueryThresholdMS?: number (defaults to maxTimeMS)
- *         - maxLimit?: number (default: 100) <-- NEW
+ *         - maxLimit?: number            (default: 100)
  *         - onSlowQuery?: (info: SlowQueryInfo) => void
  *         - onSanitizeDrop?: (path: string, value: unknown) => void
- *         - lean?: boolean (default: true)
- *
- * (rest of API documentation unchanged)
+ *         - lean?: boolean               (default: true)
  *
  * Copyright and License
  * ---------------------
  * MIT
  */
 
+import { fromZonedTime } from 'date-fns-tz';
 import mongoose, { Model, PopulateOptions, Query } from 'mongoose';
 
 type MFilter<T> = mongoose.QueryFilter<T>;
@@ -96,16 +104,28 @@ type MFilter<T> = mongoose.QueryFilter<T>;
 
 const RESERVED_KEYS = new Set<string>(['page', 'sort', 'limit', 'fields', 'q']);
 const DEFAULT_MAX_LIMIT = 100;
+const DEFAULT_LIMIT = 10;
+const MAX_PAGE = 1_000_000_000;
 const MAX_NESTING_DEPTH = 5;
 const MAX_SEARCH_LENGTH = 200;
 const MAX_SORT_FIELDS = 5;
 const DEFAULT_MAX_TIME_MS = 5_000;
+const DEFAULT_TIMEZONE = 'Asia/Dhaka';
 
 // Matches only when the date-word is the LAST path segment (e.g. "createdAt",
 // "user.updatedAt") — not an arbitrary substring like "myUpdatedAt".
 const DATE_FIELD_RE =
   /(^|\.)(createdAt|updatedAt|deletedAt|date|birthDate|expiresAt)$/i;
 const PLAIN_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// A string that already carries its own UTC offset ("Z" or "+06:00") is
+// treated as an absolute instant rather than a local wall-clock time.
+const HAS_OFFSET_RE = /([Zz]|[+-]\d{2}:?\d{2})$/;
+
+const DANGEROUS_KEYS = new Set<string>([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
 
 const COERCIBLE_OPS = new Set([
   'eq',
@@ -117,10 +137,11 @@ const COERCIBLE_OPS = new Set([
   'in',
   'nin',
 ]);
-const IN_LIKE_OPS = new Set(['in', '$in', 'nin', '$nin']);
+const IN_LIKE_OPS = new Set(['in', 'nin']);
 
 const DEFAULT_SORT: Record<string, 1 | -1> = { createdAt: -1 };
-const ALLOWED_TOP_LEVEL_OPS = new Set(['$and', '$or', '$nor', '$not']);
+// NOTE: `$not` is not a valid top-level query operator in MongoDB, so it is not allowed here.
+const ALLOWED_TOP_LEVEL_OPS = new Set(['$and', '$or', '$nor']);
 const BANNED_OPERATORS = new Set([
   '$where',
   '$expr',
@@ -134,11 +155,11 @@ const BANNED_OPERATORS = new Set([
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 export interface QueryParams {
-  page?: string;
-  limit?: string;
-  sort?: string;
-  fields?: string;
-  q?: string;
+  page?: unknown;
+  limit?: unknown;
+  sort?: unknown;
+  fields?: unknown;
+  q?: unknown;
   [key: string]: unknown;
 }
 
@@ -161,6 +182,8 @@ export interface SlowQueryInfo {
 }
 
 export interface QueryFindOptions {
+  /** IANA timezone used to interpret client-supplied local dates, e.g. "Asia/Dhaka". Validated at construction; invalid values fall back to the default. */
+  timezone?: string;
   maxTimeMS?: number;
   /** Threshold in ms above which onSlowQuery fires. Defaults to maxTimeMS. */
   slowQueryThresholdMS?: number;
@@ -172,6 +195,11 @@ export interface QueryFindOptions {
   /** Whether to call .lean() on find queries (default: true). */
   lean?: boolean;
 }
+
+/** Server-side conditions accepted by .where(). */
+export type WhereConditions<T> =
+  | Partial<Record<keyof T, unknown>>
+  | Record<string, unknown>;
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -189,31 +217,153 @@ export class QueryFindValidationError extends QueryFindError {
   }
 }
 
-// ─── Input parsing ────────────────────────────────────────────────────────────
+// ─── Internal types ───────────────────────────────────────────────────────────
 
-function parsePage(raw: string | undefined): number {
-  const n = parseInt(raw ?? '1', 10);
-  return isNaN(n) || n < 1 ? 1 : n;
+interface ResolvedOptions {
+  timezone: string;
+  maxTimeMS: number;
+  slowQueryThresholdMS: number;
+  maxLimit: number;
+  lean: boolean;
+  onSlowQuery?: (info: SlowQueryInfo) => void;
+  onSanitizeDrop?: (path: string, value: unknown) => void;
 }
 
-function parseLimit(
-  raw: string | undefined,
-  maxLimit = DEFAULT_MAX_LIMIT,
-): number {
-  const n = parseInt(raw ?? '10', 10);
-  if (isNaN(n) || n < 1) return 10;
+// ─── Input parsing ────────────────────────────────────────────────────────────
+
+function asString(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : undefined;
+}
+
+function parsePage(raw: unknown): number {
+  const n = parseInt(asString(raw) ?? '1', 10);
+  return !Number.isSafeInteger(n) || n < 1 || n > MAX_PAGE ? 1 : n;
+}
+
+function parseLimit(raw: unknown, maxLimit = DEFAULT_MAX_LIMIT): number {
+  const n = parseInt(asString(raw) ?? String(DEFAULT_LIMIT), 10);
+  if (!Number.isFinite(n) || n < 1) return Math.min(DEFAULT_LIMIT, maxLimit);
   return Math.min(n, maxLimit);
 }
 
+const validTimezones = new Set<string>();
+
+function resolveTimezone(tz: unknown): string {
+  const candidate =
+    typeof tz === 'string' && tz.trim() && tz.length <= 64
+      ? tz.trim()
+      : DEFAULT_TIMEZONE;
+  if (validTimezones.has(candidate)) return candidate;
+  try {
+    // Throws RangeError on an invalid IANA zone — cheapest available validator.
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate });
+    validTimezones.add(candidate);
+    return candidate;
+  } catch {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn(
+        `[query-find] Invalid timezone "${candidate}", falling back to "${DEFAULT_TIMEZONE}"`,
+      );
+    }
+    return DEFAULT_TIMEZONE;
+  }
+}
+
+// ─── Timezone-aware date helpers ───────────────────────────────────────────────
+
+/** True only for a real calendar date in strict "YYYY-MM-DD" form (rejects "2026-02-31"). */
+function isRealPlainDate(s: string): boolean {
+  if (!PLAIN_DATE_RE.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return (
+    dt.getUTCFullYear() === y &&
+    dt.getUTCMonth() === m - 1 &&
+    dt.getUTCDate() === d
+  );
+}
+
+/** Shifts a "YYYY-MM-DD" string by N calendar days (pure UTC date math — DST-proof). */
+function shiftLocalDateString(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+/** [start, end) UTC instants for a single local calendar date in `timezone`. */
+function plainDateToUtcRange(
+  dateStr: string,
+  timezone: string,
+): { start: Date; end: Date } {
+  const start = fromZonedTime(`${dateStr}T00:00:00.000`, timezone);
+  const end = fromZonedTime(
+    `${shiftLocalDateString(dateStr, 1)}T00:00:00.000`,
+    timezone,
+  );
+  return { start, end };
+}
+
+/** Parses a single date/datetime string to a scalar UTC Date. */
+function coerceDateScalar(value: string, timezone: string): Date | undefined {
+  let parsed: Date;
+  if (PLAIN_DATE_RE.test(value)) {
+    if (!isRealPlainDate(value)) return undefined;
+    parsed = fromZonedTime(`${value}T00:00:00.000`, timezone);
+  } else if (HAS_OFFSET_RE.test(value)) {
+    parsed = new Date(value);
+  } else {
+    parsed = fromZonedTime(value, timezone);
+  }
+  return isNaN(parsed.getTime()) ? undefined : parsed;
+}
+
+/**
+ * Coerces a date string for a date-like field. `op` is the bare comparison
+ * operator ("gt", "lte", "in", ...) or undefined for a direct field value.
+ */
+function coerceDateValue(
+  value: string,
+  op: string | undefined,
+  timezone: string,
+): unknown {
+  if (op && IN_LIKE_OPS.has(op)) {
+    // $in/$nin require scalar values, not ranges.
+    return coerceDateScalar(value, timezone) ?? value;
+  }
+  if (isRealPlainDate(value)) {
+    const { start, end } = plainDateToUtcRange(value, timezone);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) return value;
+    switch (op) {
+      case undefined:
+        return { $gte: start, $lt: end };
+      case 'gt':
+        return end;
+      case 'lte':
+        return new Date(end.getTime() - 1);
+      default: // gte / lt / eq / ne (eq/ne are normally intercepted earlier)
+        return start;
+    }
+  }
+  return coerceDateScalar(value, timezone) ?? value;
+}
+
 // ─── Sanitization ─────────────────────────────────────────────────────────────
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  if (v instanceof Date) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
 
 /**
  * Recursively strips non-plain values (class instances, functions) from an
  * arbitrary object so only JSON-safe primitives/plain objects/Dates reach the
  * query pipeline. Notifies the caller via onDrop when values are removed.
  *
- * BUG FIX: Changed depth check from `>` to `>=` to properly enforce MAX_NESTING_DEPTH.
- * This prevents nesting deeper than 5 levels (0, 1, 2, 3, 4 are allowed; 5+ rejected).
+ * Depth check uses `>=` to properly enforce MAX_NESTING_DEPTH (levels 0–4
+ * allowed; 5+ rejected). Prototype-polluting keys are skipped.
  */
 function sanitize(
   value: unknown,
@@ -248,15 +398,14 @@ function sanitize(
     return out;
   }
 
-  if (t === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
-    const src = value as Record<string, unknown>;
+  if (isPlainObject(value)) {
+    const src = value;
     const out: Record<string, unknown> = {};
-    for (const k in src) {
-      if (Object.prototype.hasOwnProperty.call(src, k)) {
-        const childPath = path ? `${path}.${k}` : k;
-        const s = sanitize(src[k], depth + 1, childPath, onDrop);
-        if (s !== undefined) out[k] = s;
-      }
+    for (const k of Object.keys(src)) {
+      if (DANGEROUS_KEYS.has(k)) continue;
+      const childPath = path ? `${path}.${k}` : k;
+      const s = sanitize(src[k], depth + 1, childPath, onDrop);
+      if (s !== undefined) out[k] = s;
     }
     return out;
   }
@@ -290,9 +439,12 @@ function isFieldAllowed(field: string, allowedLookup: Set<string>): boolean {
 
 /**
  * Removes any non-operator key not present in the allowlist. Operator keys
- * ($and/$or/$nor/$not and any nested operator) are recursed into so that a
+ * ($and/$or/$nor and any nested operator) are recursed into so that a
  * client cannot bypass the field allowlist by wrapping a disallowed field
  * inside a logical operator (e.g. ?$or[0][secretField]=x).
+ *
+ * Clauses that were fully stripped are dropped (an empty clause would
+ * otherwise match everything inside $or).
  */
 function enforceAllowlist(
   filter: Record<string, unknown>,
@@ -302,17 +454,21 @@ function enforceAllowlist(
   if (allowedLookup.size === 0) return filter;
 
   const out: Record<string, unknown> = {};
-  for (const k in filter) {
-    if (!Object.prototype.hasOwnProperty.call(filter, k)) continue;
+  for (const k of Object.keys(filter)) {
     const v = filter[k];
 
     if (k.startsWith('$')) {
       if (Array.isArray(v)) {
-        out[k] = v.map((item) =>
-          isPlainObject(item)
-            ? enforceAllowlist(item, allowedLookup, canonicalMap)
-            : item,
-        );
+        const items = v
+          .map((item) =>
+            isPlainObject(item)
+              ? enforceAllowlist(item, allowedLookup, canonicalMap)
+              : item,
+          )
+          .filter(
+            (item) => !(isPlainObject(item) && Object.keys(item).length === 0),
+          );
+        if (items.length > 0) out[k] = items;
       } else if (isPlainObject(v)) {
         out[k] = enforceAllowlist(v, allowedLookup, canonicalMap);
       } else {
@@ -327,49 +483,37 @@ function enforceAllowlist(
   return out;
 }
 
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return (
-    v !== null &&
-    typeof v === 'object' &&
-    !Array.isArray(v) &&
-    !(v instanceof Date) &&
-    Object.getPrototypeOf(v) === Object.prototype
-  );
-}
-
 // ─── Fused coercion pass ──────────────────────────────────────────────────────
 
 /**
  * Single-pass coercion:
  *  - 'true' / 'false' strings → booleans
- *  - Date-field strings → Date objects ($gte/$lt range for plain YYYY-MM-DD)
+ *  - Date-field strings → Date objects, interpreted in `timezone`
+ *    (plain YYYY-MM-DD → whole-local-day range or boundary depending on op)
  *  - Shorthand operator keys (eq, ne, gt, …) → prefixed form ($eq, $ne, …)
+ *  - ?field[in]=a,b,c → ['a','b','c']
  *
  * Inside an $in/$nin array, plain-date strings are coerced to a scalar Date
  * rather than a {$gte,$lt} range object, since $in/$nin require scalar values.
- *
- * OPTIMIZATION: Filter out undefined values before pushing to avoid bloating arrays
- * with undefined entries that would be skipped later anyway.
+ * `parentOp` is the BARE operator name (no leading "$").
  */
-function coerceAll(value: unknown, parentKey = '', parentOp?: string): unknown {
+function coerceAll(
+  value: unknown,
+  timezone: string,
+  parentKey = '',
+  parentOp?: string,
+): unknown {
   if (value === null) return null;
 
   if (typeof value === 'string') {
     if (value === 'true') return true;
     if (value === 'false') return false;
 
-    if (DATE_FIELD_RE.test(parentKey)) {
-      const parsed = new Date(value);
-      if (!isNaN(parsed.getTime())) {
-        if (PLAIN_DATE_RE.test(value)) {
-          if (parentOp && IN_LIKE_OPS.has(parentOp)) return parsed;
-          const start = new Date(value);
-          const end = new Date(start);
-          end.setUTCDate(end.getUTCDate() + 1);
-          return { $gte: start, $lt: end };
-        }
-        return parsed;
-      }
+    if (
+      DATE_FIELD_RE.test(parentKey) &&
+      (!parentOp || COERCIBLE_OPS.has(parentOp))
+    ) {
+      return coerceDateValue(value, parentOp, timezone);
     }
     return value;
   }
@@ -378,8 +522,8 @@ function coerceAll(value: unknown, parentKey = '', parentOp?: string): unknown {
 
   if (Array.isArray(value)) {
     const out: unknown[] = [];
-    for (let i = 0; i < value.length; i++) {
-      const coerced = coerceAll(value[i], parentKey, parentOp);
+    for (const item of value) {
+      const coerced = coerceAll(item, timezone, parentKey, parentOp);
       if (coerced !== undefined) out.push(coerced);
     }
     return out;
@@ -387,14 +531,55 @@ function coerceAll(value: unknown, parentKey = '', parentOp?: string): unknown {
 
   const src = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
-  for (const k in src) {
-    if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
-    const newKey = COERCIBLE_OPS.has(k) ? `$${k}` : k;
+  for (const k of Object.keys(src)) {
+    if (DANGEROUS_KEYS.has(k)) continue;
+    const v = src[k];
+
     const isOp = k.startsWith('$') || COERCIBLE_OPS.has(k);
-    const childPath = isOp ? parentKey : parentKey ? `${parentKey}.${k}` : k;
-    // Reset parentOp when descending into a new field (isOp=false) so a
-    // stale $in/$nin context from a sibling branch can't leak in.
-    out[newKey] = coerceAll(src[k], childPath, isOp ? k : undefined);
+    if (!isOp) {
+      // Reset parentOp when descending into a new field so a stale
+      // $in/$nin context from a sibling branch can't leak in.
+      out[k] = coerceAll(
+        v,
+        timezone,
+        parentKey ? `${parentKey}.${k}` : k,
+        undefined,
+      );
+      continue;
+    }
+
+    const bare = k.startsWith('$') ? k.slice(1) : k;
+    const outKey = k.startsWith('$') ? k : `$${k}`;
+
+    // ?field[eq]=2026-09-01 / [ne]= on a date field -> whole-day range semantics.
+    if (
+      (bare === 'eq' || bare === 'ne') &&
+      typeof v === 'string' &&
+      isRealPlainDate(v) &&
+      DATE_FIELD_RE.test(parentKey)
+    ) {
+      const { start, end } = plainDateToUtcRange(v, timezone);
+      if (!isNaN(start.getTime()) && !isNaN(end.getTime())) {
+        if (bare === 'eq') {
+          out.$gte = start;
+          out.$lt = end;
+        } else {
+          out.$not = { $gte: start, $lt: end };
+        }
+        continue;
+      }
+    }
+
+    // ?field[in]=a,b,c -> ['a','b','c']
+    const child =
+      IN_LIKE_OPS.has(bare) && typeof v === 'string'
+        ? v
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : v;
+
+    out[outKey] = coerceAll(child, timezone, parentKey, bare);
   }
   return out;
 }
@@ -402,34 +587,43 @@ function coerceAll(value: unknown, parentKey = '', parentOp?: string): unknown {
 // ─── Operator validation ──────────────────────────────────────────────────────
 
 /**
- * Throws on any BANNED_OPERATORS key at any depth, and on any top-level $ key
- * that isn't in ALLOWED_TOP_LEVEL_OPS.
+ * Throws on any BANNED_OPERATORS key at any depth. When `topLevelCheck` is true
+ * (client input) it also throws on any top-level $ key not in ALLOWED_TOP_LEVEL_OPS
+ * and requires logical operators to hold a non-empty array of plain objects.
  */
 function rejectDisallowedOperators(
   filter: Record<string, unknown>,
   depth = 0,
+  topLevelCheck = true,
 ): void {
-  for (const k in filter) {
-    if (!Object.prototype.hasOwnProperty.call(filter, k)) continue;
-
+  for (const k of Object.keys(filter)) {
     if (BANNED_OPERATORS.has(k)) {
       throw new QueryFindValidationError(
         `Disallowed operator in query: "${k}"`,
       );
     }
-    if (depth === 0 && k.startsWith('$') && !ALLOWED_TOP_LEVEL_OPS.has(k)) {
-      throw new QueryFindValidationError(
-        `Disallowed top-level operator in query string: "${k}"`,
-      );
+    const v = filter[k];
+
+    if (topLevelCheck && depth === 0 && k.startsWith('$')) {
+      if (!ALLOWED_TOP_LEVEL_OPS.has(k)) {
+        throw new QueryFindValidationError(
+          `Disallowed top-level operator in query string: "${k}"`,
+        );
+      }
+      if (!Array.isArray(v) || v.length === 0 || !v.every(isPlainObject)) {
+        throw new QueryFindValidationError(
+          `Operator "${k}" requires a non-empty array of conditions`,
+        );
+      }
     }
 
-    const v = filter[k];
     if (Array.isArray(v)) {
       for (const item of v) {
-        if (isPlainObject(item)) rejectDisallowedOperators(item, depth + 1);
+        if (isPlainObject(item))
+          rejectDisallowedOperators(item, depth + 1, topLevelCheck);
       }
     } else if (isPlainObject(v)) {
-      rejectDisallowedOperators(v, depth + 1);
+      rejectDisallowedOperators(v, depth + 1, topLevelCheck);
     }
   }
 }
@@ -440,17 +634,16 @@ function buildFilter(
   raw: QueryParams,
   allowedLookup: Set<string>,
   canonicalMap: Map<string, string>,
+  timezone: string,
   onDrop?: (path: string, value: unknown) => void,
 ): Record<string, unknown> {
   const stripped: Record<string, unknown> = {};
-  for (const k in raw) {
-    if (Object.prototype.hasOwnProperty.call(raw, k) && !RESERVED_KEYS.has(k)) {
-      stripped[k] = raw[k];
-    }
+  for (const k of Object.keys(raw)) {
+    if (!RESERVED_KEYS.has(k) && !DANGEROUS_KEYS.has(k)) stripped[k] = raw[k];
   }
 
   const safe = sanitize(stripped, 0, '', onDrop) as Record<string, unknown>;
-  const coerced = coerceAll(safe) as Record<string, unknown>;
+  const coerced = coerceAll(safe, timezone) as Record<string, unknown>;
   const allowed = enforceAllowlist(coerced, allowedLookup, canonicalMap);
   rejectDisallowedOperators(allowed);
   return allowed;
@@ -479,7 +672,7 @@ function parseSort(
 
     const desc = trimmed.startsWith('-');
     const field = desc ? trimmed.slice(1).trim() : trimmed;
-    if (!field) continue;
+    if (!field || field.startsWith('$') || DANGEROUS_KEYS.has(field)) continue;
 
     if (allowedLookup.size > 0) {
       if (!isFieldAllowed(field, allowedLookup)) continue;
@@ -498,19 +691,23 @@ function parseSort(
 /**
  * Filters a space-separated projection string against the allowlist and
  * normalizes each field to its canonical case. _id and __v are always
- * permitted. Returns '' when every token is blocked — callers must handle
- * this explicitly to avoid an accidental "select everything".
+ * permitted. `+field` (force-select hidden fields) and `$` tokens are never
+ * accepted from the client. Returns '' when every token is blocked — callers
+ * must handle this explicitly to avoid an accidental "select everything".
  */
 function sanitizeProjection(
   projection: string,
   allowedLookup: Set<string>,
   canonicalMap: Map<string, string>,
 ): string {
-  if (allowedLookup.size === 0) return projection;
-
-  return projection
+  const tokens = projection
     .split(/\s+/)
     .filter(Boolean)
+    .filter((token) => !token.startsWith('+') && !token.includes('$'));
+
+  if (allowedLookup.size === 0) return tokens.join(' ');
+
+  return tokens
     .filter((token) => {
       const field = token.startsWith('-') ? token.slice(1) : token;
       return (
@@ -531,10 +728,11 @@ function sanitizeProjection(
 // ─── QueryFind ────────────────────────────────────────────────────────────────
 
 /**
- * Fluent query builder / paginator for Mongoose 8/9.
+ * Fluent query builder / paginator for Mongoose 8/9, with timezone-aware
+ * date filtering.
  *
  * @example
- * const result = await new QueryFind(User.find(), req.query)
+ * const result = await new QueryFind(User.find(), req.query, { timezone })
  *   .allowFields(['name', 'email', 'role', 'createdAt'])
  *   .where({ orgId: req.user.orgId, deletedAt: null })
  *   .filter()
@@ -550,21 +748,20 @@ export class QueryFind<
 > {
   private readonly model: TModelType;
   private readonly qs: Readonly<QueryParams>;
-  private readonly options: Required<
-    Omit<QueryFindOptions, 'onSlowQuery' | 'onSanitizeDrop'>
-  > &
-    Pick<QueryFindOptions, 'onSlowQuery' | 'onSanitizeDrop'>;
+  private readonly options: ResolvedOptions;
 
   private _allowedLookup: Set<string> = new Set();
   private _canonicalMap: Map<string, string> = new Map();
 
   /**
    * URL-derived filter and server conditions are kept separate so server
-   * conditions (merged last, in buildFinalFilter) can never be overridden by
-   * URL params, regardless of call order between where() and filter().
+   * conditions can never be overridden by URL params, regardless of call
+   * order between where() and filter(). Server conditions are a list
+   * (AND-ed together) so repeated where() calls on one field never
+   * overwrite each other.
    */
   private _urlFilter: Record<string, unknown> = {};
-  private _serverConditions: Record<string, unknown> = {};
+  private _serverConditions: Record<string, unknown>[] = [];
 
   /** $or clauses from globalSearch(), assembled once in buildFinalFilter(). */
   private _searchOr: Record<string, unknown>[] = [];
@@ -586,19 +783,49 @@ export class QueryFind<
   ) {
     this.model = query.model as unknown as TModelType;
     this.qs = Object.freeze({ ...queryString });
+
+    // Conditions already present on the passed-in query (e.g. User.find({ orgId }))
+    // are kept as mandatory server conditions instead of being silently dropped.
+    try {
+      const base = query.getFilter?.() as Record<string, unknown> | undefined;
+      if (base && Object.keys(base).length > 0) {
+        this._serverConditions.push({ ...base });
+      }
+    } catch {
+      // Ignore — a query without a readable filter simply contributes nothing.
+    }
+
+    const maxLimit =
+      typeof options.maxLimit === 'number' &&
+      Number.isFinite(options.maxLimit) &&
+      options.maxLimit >= 1
+        ? Math.floor(options.maxLimit)
+        : DEFAULT_MAX_LIMIT;
+    const maxTimeMS =
+      typeof options.maxTimeMS === 'number' &&
+      Number.isFinite(options.maxTimeMS) &&
+      options.maxTimeMS >= 0
+        ? options.maxTimeMS
+        : DEFAULT_MAX_TIME_MS;
+
     this.options = {
-      maxTimeMS: options.maxTimeMS ?? DEFAULT_MAX_TIME_MS,
+      timezone: resolveTimezone(options.timezone),
+      maxTimeMS,
       slowQueryThresholdMS:
         options.slowQueryThresholdMS ??
-        options.maxTimeMS ??
-        DEFAULT_MAX_TIME_MS,
-      maxLimit: options.maxLimit ?? DEFAULT_MAX_LIMIT,
+        (maxTimeMS > 0 ? maxTimeMS : DEFAULT_MAX_TIME_MS),
+      maxLimit,
       lean: options.lean ?? true,
       onSlowQuery: options.onSlowQuery,
       onSanitizeDrop: options.onSanitizeDrop,
     };
     this._page = parsePage(this.qs.page);
     this._limit = parseLimit(this.qs.limit, this.options.maxLimit);
+  }
+
+  /** The resolved (validated) timezone this instance is using. */
+  get timezone(): string {
+    return this.options.timezone;
   }
 
   // ── Configuration ─────────────────────────────────────────────────────────
@@ -620,13 +847,15 @@ export class QueryFind<
   /**
    * Parses URL query params into a Mongoose filter and merges them into the
    * URL-derived filter store. Only allowlisted fields pass through (including
-   * fields nested inside $and/$or/$nor/$not). Reserved keys are stripped first.
+   * fields nested inside $and/$or/$nor). Reserved keys are stripped first.
+   * Date strings are interpreted in this instance's timezone.
    */
   filter(): this {
     const parsed = buildFilter(
       this.qs,
       this._allowedLookup,
       this._canonicalMap,
+      this.options.timezone,
       this.options.onSanitizeDrop,
     );
     Object.assign(this._urlFilter, parsed);
@@ -634,14 +863,24 @@ export class QueryFind<
   }
 
   /**
-   * Mandatory server-side conditions the client cannot override — merged
-   * into the final filter last. Values are not sanitized (ObjectIds, Dates,
-   * etc. are valid); banned $ operators are still rejected.
+   * Mandatory server-side conditions the client cannot override — AND-ed
+   * with the final filter. Repeated calls are AND-ed together, never
+   * overwritten. Values are not sanitized (ObjectIds, Dates, etc. are
+   * valid); banned $ operators are still rejected, and `undefined` values
+   * throw (an undefined condition would silently match everything).
    */
-  where(conditions: Partial<Record<keyof TRawDocType, unknown>>): this {
+  where(conditions: WhereConditions<TRawDocType>): this {
     const asRecord = conditions as Record<string, unknown>;
-    rejectDisallowedOperators(asRecord);
-    Object.assign(this._serverConditions, asRecord);
+    for (const k of Object.keys(asRecord)) {
+      if (asRecord[k] === undefined) {
+        throw new QueryFindValidationError(
+          `where: condition for "${k}" is undefined`,
+        );
+      }
+    }
+    rejectDisallowedOperators(asRecord, 0, false);
+    if (Object.keys(asRecord).length === 0) return this;
+    this._serverConditions.push({ ...asRecord });
     return this;
   }
 
@@ -651,7 +890,7 @@ export class QueryFind<
    * multiple times — extends the $or list rather than re-wrapping the filter.
    */
   globalSearch(fields: string[]): this {
-    const raw = this.qs.q?.trim();
+    const raw = asString(this.qs.q)?.trim();
     if (!raw || raw.length > MAX_SEARCH_LENGTH || fields.length === 0)
       return this;
 
@@ -672,12 +911,9 @@ export class QueryFind<
    * Fields not in allowFields() are dropped; falls back to DEFAULT_SORT.
    */
   sort(): this {
-    if (this.qs.sort) {
-      this._sort = parseSort(
-        this.qs.sort,
-        this._allowedLookup,
-        this._canonicalMap,
-      );
+    const raw = asString(this.qs.sort);
+    if (raw) {
+      this._sort = parseSort(raw, this._allowedLookup, this._canonicalMap);
     }
     return this;
   }
@@ -691,8 +927,9 @@ export class QueryFind<
   limitFields(defaultFields?: string): this {
     if (defaultFields) this._defaultFields = defaultFields;
 
-    if (this.qs.fields) {
-      const raw = this.qs.fields
+    const fieldsRaw = asString(this.qs.fields);
+    if (fieldsRaw) {
+      const raw = fieldsRaw
         .split(',')
         .map((f) => f.trim())
         .filter(Boolean)
@@ -711,9 +948,10 @@ export class QueryFind<
 
   /**
    * Registers a populate path. `match` is sanitized (non-plain values
-   * stripped) and boolean/date strings coerced, then checked for banned
-   * operators — but NOT restricted to the main model's allowFields(), since
-   * the populated model may have an entirely different schema.
+   * stripped) and boolean/date strings coerced (dates in this instance's
+   * timezone), then checked for banned operators — but NOT restricted to the
+   * main model's allowFields(), since the populated model may have an
+   * entirely different schema.
    */
   populate(path: string | PopulateOptions, select?: string): this {
     if (typeof path === 'string') {
@@ -728,8 +966,11 @@ export class QueryFind<
         'populate.match',
         this.options.onSanitizeDrop,
       ) as Record<string, unknown>;
-      const coercedMatch = coerceAll(safeMatch) as Record<string, unknown>;
-      rejectDisallowedOperators(coercedMatch);
+      const coercedMatch = coerceAll(
+        safeMatch,
+        this.options.timezone,
+      ) as Record<string, unknown>;
+      rejectDisallowedOperators(coercedMatch, 0, false);
       this._populates.push({ ...path, match: coercedMatch });
     } else {
       this._populates.push(path);
@@ -740,43 +981,37 @@ export class QueryFind<
   // ── Private helpers ───────────────────────────────────────────────────────
 
   /**
+   * Effective sort: the requested sort plus `_id` as a stable tiebreaker
+   * (prevents duplicate/missing rows across pages).
+   */
+  private effectiveSort(): Record<string, 1 | -1> {
+    if ('_id' in this._sort) return { ...this._sort };
+    const dir: 1 | -1 = Object.values(this._sort)[0] ?? -1;
+    return { ...this._sort, _id: dir };
+  }
+
+  /**
    * Assembles the final filter from three sources:
    *   1. URL-derived filter (client controlled)
    *   2. Global search $or clause
-   *   3. Server conditions (highest priority)
+   *   3. Server conditions (each AND-ed, so they can never be overridden)
    *
    * Combined with $and rather than object-spread, so a server condition on
    * the same field as a URL filter narrows the query instead of silently
    * discarding one side.
-   *
-   * OPTIMIZATION: Eliminated unnecessary object spreads. Use direct assignment
-   * to reduce garbage collection pressure.
    */
   private buildFinalFilter(): Record<string, unknown> {
-    let base: Record<string, unknown>;
+    const clauses: Record<string, unknown>[] = [];
 
-    // Avoid spreading the URL filter; just use it directly initially
-    const hasUrlFilter = Object.keys(this._urlFilter).length > 0;
-
-    if (this._searchOr.length > 0) {
-      if (hasUrlFilter) {
-        base = { $and: [this._urlFilter, { $or: this._searchOr }] };
-      } else {
-        base = { $or: this._searchOr };
-      }
-    } else {
-      base = hasUrlFilter ? this._urlFilter : {};
+    if (Object.keys(this._urlFilter).length > 0) clauses.push(this._urlFilter);
+    if (this._searchOr.length > 0) clauses.push({ $or: this._searchOr });
+    for (const cond of this._serverConditions) {
+      if (Object.keys(cond).length > 0) clauses.push(cond);
     }
 
-    const hasServer = Object.keys(this._serverConditions).length > 0;
-
-    if (Object.keys(base).length > 0 && hasServer) {
-      return { $and: [base, this._serverConditions] };
-    }
-    if (hasServer) {
-      return this._serverConditions;
-    }
-    return base;
+    if (clauses.length === 0) return {};
+    if (clauses.length === 1) return clauses[0];
+    return { $and: clauses };
   }
 
   private execFind(
@@ -786,7 +1021,7 @@ export class QueryFind<
     const { maxTimeMS, lean } = this.options;
     const q = this.model
       .find(mongoFilter)
-      .sort(this._sort)
+      .sort(this.effectiveSort())
       .skip(skip)
       .limit(this._limit);
 
@@ -805,15 +1040,13 @@ export class QueryFind<
   ): Promise<number> {
     const { maxTimeMS } = this.options;
     if (!hasFilter) {
-      return (await this.model
-        .estimatedDocumentCount()
-        .maxTimeMS(maxTimeMS)
-        .exec()) as number;
+      const q = this.model.estimatedDocumentCount();
+      if (maxTimeMS > 0) q.maxTimeMS(maxTimeMS);
+      return (await q.exec()) as number;
     }
-    return (await this.model
-      .countDocuments(mongoFilter)
-      .maxTimeMS(maxTimeMS)
-      .exec()) as number;
+    const q = this.model.countDocuments(mongoFilter);
+    if (maxTimeMS > 0) q.maxTimeMS(maxTimeMS);
+    return (await q.exec()) as number;
   }
 
   private async wrapTimed<R>(
@@ -822,17 +1055,28 @@ export class QueryFind<
     limit: number,
     filter: Record<string, unknown>,
   ): Promise<R> {
-    const { onSlowQuery, slowQueryThresholdMS, maxTimeMS } = this.options;
+    const { onSlowQuery, slowQueryThresholdMS } = this.options;
     if (!onSlowQuery) return fn();
 
     const start = Date.now();
-    const result = await fn();
-    const elapsedMs = Date.now() - start;
-
-    if (elapsedMs >= (slowQueryThresholdMS ?? maxTimeMS)) {
-      onSlowQuery({ elapsedMs, filter, sort: this._sort, page, limit });
+    try {
+      return await fn();
+    } finally {
+      const elapsedMs = Date.now() - start;
+      if (elapsedMs >= slowQueryThresholdMS) {
+        try {
+          onSlowQuery({
+            elapsedMs,
+            filter,
+            sort: this.effectiveSort(),
+            page,
+            limit,
+          });
+        } catch {
+          // A faulty logging callback must never break the query.
+        }
+      }
     }
-    return result;
   }
 
   // ── Terminal ───────────────────────────────────────────────────────────────
@@ -875,6 +1119,11 @@ export class QueryFind<
     }
 
     if (cachedTotal !== undefined) {
+      if (!Number.isInteger(cachedTotal) || cachedTotal < 0) {
+        throw new QueryFindValidationError(
+          `paginate: "cachedTotal" must be a non-negative integer, got ${cachedTotal}`,
+        );
+      }
       const totalPages = Math.max(Math.ceil(cachedTotal / limit), 1);
       const safePage = page > totalPages ? 1 : page;
       const data = await this.wrapTimed(
